@@ -1,6 +1,7 @@
 #include "audio.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define NUM_BUFFERS 4
 
@@ -12,79 +13,100 @@ static void *g_cb_userdata = NULL;
 static volatile int g_running = 0;
 static int g_what_u_hear_active = 0;
 
-/* Programmatically find and select "What U Hear" MUX control */
+/* Programmatically find and select "What U Hear" MUX control across all mixers */
 static int configure_what_u_hear(void) {
-    HMIXER hmx = NULL;
-    if (mixerOpen(&hmx, 0, 0, 0, MIXER_OBJECTF_MIXER) != MMSYSERR_NOERROR) {
-        return 0;
-    }
+    UINT num_mixers = mixerGetNumDevs();
+    for (UINT m = 0; m < num_mixers; m++) {
+        HMIXER hmx = NULL;
+        if (mixerOpen(&hmx, m, 0, 0, MIXER_OBJECTF_MIXER) != MMSYSERR_NOERROR) {
+            continue;
+        }
 
-    MIXERLINEA dstLine;
-    memset(&dstLine, 0, sizeof(dstLine));
-    dstLine.cbStruct = sizeof(dstLine);
-    dstLine.dwDestination = 1; // Recording Control Destination
+        MIXERCAPSA mc;
+        if (mixerGetDevCapsA(m, &mc, sizeof(mc)) != MMSYSERR_NOERROR) {
+            mixerClose(hmx);
+            continue;
+        }
 
-    if (mixerGetLineInfoA((HMIXEROBJ)hmx, &dstLine, MIXER_GETLINEINFOF_DESTINATION) != MMSYSERR_NOERROR) {
-        mixerClose(hmx);
-        return 0;
-    }
+        for (DWORD d = 0; d < mc.cDestinations; d++) {
+            MIXERLINEA dstLine;
+            memset(&dstLine, 0, sizeof(dstLine));
+            dstLine.cbStruct = sizeof(dstLine);
+            dstLine.dwDestination = d;
 
-    MIXERLINECONTROLSA mlc;
-    MIXERCONTROLA mctrl;
-    memset(&mlc, 0, sizeof(mlc));
-    memset(&mctrl, 0, sizeof(mctrl));
-    mlc.cbStruct = sizeof(mlc);
-    mlc.dwLineID = dstLine.dwLineID;
-    mlc.cControls = 1;
-    mlc.cbmxctrl = sizeof(MIXERCONTROLA);
-    mlc.pamxctrl = &mctrl;
+            if (mixerGetLineInfoA((HMIXEROBJ)hmx, &dstLine, MIXER_GETLINEINFOF_DESTINATION) != MMSYSERR_NOERROR) {
+                continue;
+            }
 
-    if (mixerGetLineControlsA((HMIXEROBJ)hmx, &mlc, MIXER_GETLINECONTROLSF_ALL) != MMSYSERR_NOERROR) {
-        mixerClose(hmx);
-        return 0;
-    }
+            // Only check recording destinations
+            if (dstLine.dwComponentType != MIXERLINE_COMPONENTTYPE_DST_WAVEIN) {
+                continue;
+            }
 
-    if ((mctrl.dwControlType & MIXERCONTROL_CT_CLASS_MASK) == MIXERCONTROL_CT_CLASS_LIST) {
-        DWORD numItems = mctrl.cMultipleItems;
-        if (numItems > 0) {
-            MIXERCONTROLDETAILS_LISTTEXTA *listText = calloc(numItems, sizeof(MIXERCONTROLDETAILS_LISTTEXTA));
-            MIXERCONTROLDETAILS_BOOLEAN *vals = calloc(numItems, sizeof(MIXERCONTROLDETAILS_BOOLEAN));
-            MIXERCONTROLDETAILS mcd;
+            if (dstLine.cControls == 0) continue;
 
-            memset(&mcd, 0, sizeof(mcd));
-            mcd.cbStruct = sizeof(mcd);
-            mcd.dwControlID = mctrl.dwControlID;
-            mcd.cChannels = 1;
-            mcd.cMultipleItems = numItems;
-            mcd.cbDetails = sizeof(MIXERCONTROLDETAILS_LISTTEXTA);
-            mcd.paDetails = listText;
+            MIXERLINECONTROLSA mlc;
+            MIXERCONTROLA *controls = calloc(dstLine.cControls, sizeof(MIXERCONTROLA));
+            if (!controls) continue;
 
-            if (mixerGetControlDetailsA((HMIXEROBJ)hmx, &mcd, MIXER_GETCONTROLDETAILSF_LISTTEXT) == MMSYSERR_NOERROR) {
-                int what_u_hear_idx = -1;
-                for (DWORD i = 0; i < numItems; i++) {
-                    if (strstr(listText[i].szName, "What U Hear") || strstr(listText[i].szName, "Stereo Mix")) {
-                        what_u_hear_idx = (int)i;
-                        break;
-                    }
-                }
+            memset(&mlc, 0, sizeof(mlc));
+            mlc.cbStruct = sizeof(mlc);
+            mlc.dwLineID = dstLine.dwLineID;
+            mlc.cControls = dstLine.cControls;
+            mlc.cbmxctrl = sizeof(MIXERCONTROLA);
+            mlc.pamxctrl = controls;
 
-                if (what_u_hear_idx >= 0) {
-                    for (DWORD i = 0; i < numItems; i++) {
-                        vals[i].fValue = ((int)i == what_u_hear_idx) ? 1 : 0;
-                    }
-                    mcd.cbDetails = sizeof(MIXERCONTROLDETAILS_BOOLEAN);
-                    mcd.paDetails = vals;
-                    if (mixerSetControlDetails((HMIXEROBJ)hmx, &mcd, MIXER_SETCONTROLDETAILSF_VALUE) == MMSYSERR_NOERROR) {
-                        g_what_u_hear_active = 1;
+            if (mixerGetLineControlsA((HMIXEROBJ)hmx, &mlc, MIXER_GETLINECONTROLSF_ALL) == MMSYSERR_NOERROR) {
+                for (DWORD c = 0; c < dstLine.cControls; c++) {
+                    if ((controls[c].dwControlType & MIXERCONTROL_CT_CLASS_MASK) == MIXERCONTROL_CT_CLASS_LIST) {
+                        DWORD numItems = controls[c].cMultipleItems;
+                        if (numItems > 0) {
+                            MIXERCONTROLDETAILS_LISTTEXTA *listText = calloc(numItems, sizeof(MIXERCONTROLDETAILS_LISTTEXTA));
+                            MIXERCONTROLDETAILS_BOOLEAN *vals = calloc(numItems, sizeof(MIXERCONTROLDETAILS_BOOLEAN));
+                            MIXERCONTROLDETAILS mcd;
+
+                            memset(&mcd, 0, sizeof(mcd));
+                            mcd.cbStruct = sizeof(mcd);
+                            mcd.dwControlID = controls[c].dwControlID;
+                            mcd.cChannels = 1;
+                            mcd.cMultipleItems = numItems;
+                            mcd.cbDetails = sizeof(MIXERCONTROLDETAILS_LISTTEXTA);
+                            mcd.paDetails = listText;
+
+                            if (mixerGetControlDetailsA((HMIXEROBJ)hmx, &mcd, MIXER_GETCONTROLDETAILSF_LISTTEXT) == MMSYSERR_NOERROR) {
+                                int target_idx = -1;
+                                for (DWORD i = 0; i < numItems; i++) {
+                                    if (strstr(listText[i].szName, "What U Hear") ||
+                                        strstr(listText[i].szName, "Stereo Mix") ||
+                                        strstr(listText[i].szName, "Wave Out Mix")) {
+                                        target_idx = (int)i;
+                                        break;
+                                    }
+                                }
+
+                                if (target_idx >= 0) {
+                                    for (DWORD i = 0; i < numItems; i++) {
+                                        vals[i].fValue = ((int)i == target_idx) ? 1 : 0;
+                                    }
+                                    mcd.cbDetails = sizeof(MIXERCONTROLDETAILS_BOOLEAN);
+                                    mcd.paDetails = vals;
+                                    if (mixerSetControlDetails((HMIXEROBJ)hmx, &mcd, MIXER_SETCONTROLDETAILSF_VALUE) == MMSYSERR_NOERROR) {
+                                        g_what_u_hear_active = 1;
+                                    }
+                                }
+                            }
+                            free(vals);
+                            free(listText);
+                        }
                     }
                 }
             }
-            free(vals);
-            free(listText);
+            free(controls);
         }
+        mixerClose(hmx);
+        if (g_what_u_hear_active) break;
     }
 
-    mixerClose(hmx);
     return g_what_u_hear_active;
 }
 

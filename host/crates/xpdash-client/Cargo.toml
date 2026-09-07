@@ -12,3 +12,5 @@ log.workspace = true
 env_logger.workspace = true
 ringbuf.workspace = true
 cpal.workspace = true
+lz4_flex.workspace = true
+socket2.workspace = true

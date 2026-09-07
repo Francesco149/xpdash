@@ -4,22 +4,19 @@
 #include <windows.h>
 #include <stdint.h>
 
-typedef struct {
-    uint16_t width;
-    uint16_t height;
-    uint8_t  bpp;
-    uint8_t  *pixels;
-    uint32_t size_bytes;
-    uint32_t pts_ms;
-} VideoFrame;
-
-typedef void (*video_frame_cb)(const VideoFrame *frame, void *user_data);
+typedef void (*video_frame_cb)(const uint8_t *comp_data, uint32_t comp_size,
+                               uint32_t frame_index, uint16_t width, uint16_t height,
+                               uint8_t codec, uint8_t flags, uint32_t pts_ms,
+                               void *user_data);
 
 /* Initialize video capture engine */
 int video_init(video_frame_cb callback, void *user_data);
 
-/* Capture a single frame from the desktop */
+/* Capture and compress a single frame from the desktop if dirty */
 int video_capture(void);
+
+/* Force next frame to be a full keyframe */
+void video_force_keyframe(void);
 
 /* Handle resolution change event (e.g. from WM_DISPLAYCHANGE) */
 int video_resize(int new_width, int new_height);

@@ -12,3 +12,5 @@ log.workspace = true
 env_logger.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
+lz4_flex.workspace = true
+socket2.workspace = true

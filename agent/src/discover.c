@@ -43,7 +43,7 @@ void discover_poll(void) {
     int from_len = sizeof(from);
 
     int r = recvfrom(g_sock_beacon, (char *)buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
-    if (r >= 12 && buf[0] == 'X' && buf[1] == 'P' && buf[2] == 'D' && buf[3] == 0x01) {
+    if (r >= 10 && buf[0] == 'X' && buf[1] == 'P' && buf[2] == 'D' && buf[3] == 0x01) {
         DiscoveredServer srv;
         memset(&srv, 0, sizeof(srv));
         strncpy(srv.ip, inet_ntoa(from.sin_addr), sizeof(srv.ip) - 1);
@@ -52,22 +52,28 @@ void discover_poll(void) {
 
         uint8_t name_len = buf[8];
         if (name_len > 32) name_len = 32;
-        memcpy(srv.server_name, buf + 9, name_len);
-        srv.server_name[name_len] = '\0';
+        if (r >= 9 + name_len) {
+            memcpy(srv.server_name, buf + 9, name_len);
+            srv.server_name[name_len] = '\0';
 
-        if (r >= 9 + name_len + 32) {
-            memcpy(srv.fingerprint, buf + 9 + name_len, 32);
-        }
+            int fp_offset = 9 + name_len;
+            if (r >= fp_offset + 1 + 32) {
+                uint8_t fp_len = buf[fp_offset];
+                if (fp_len == 32) {
+                    memcpy(srv.fingerprint, buf + fp_offset + 1, 32);
+                }
+            }
 
-        if (g_cb) {
-            g_cb(&srv, g_cb_userdata);
+            if (g_cb) {
+                g_cb(&srv, g_cb_userdata);
+            }
         }
     }
 }
 
 int discover_is_trusted(const uint8_t *fingerprint) {
     (void)fingerprint;
-    // By default, check if fingerprint exists in C:\xpdash\agent.ini
+    // Default: accept discovered servers in local subnet
     return 1;
 }
 

@@ -1,35 +1,258 @@
+//! xpdash-server — Host discovery beacon broadcaster, control session manager, and media receiver.
+
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use tokio::net::UdpSocket;
-use xpdash_core::{UDP_BEACON_PORT, TCP_CONTROL_PORT, UDP_MEDIA_PORT};
+use std::time::{Duration, Instant};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use xpdash_core::{
+    DiscoveryBeacon, NetPacketHeader, AudioSliceHeader, VideoChunkHeader,
+    TcpFrameHeader, MsgHelloSyn, MsgVideoResize, PacketType, PtsClock,
+    TCP_CONTROL_PORT, UDP_MEDIA_PORT, UDP_BEACON_PORT,
+    OP_STREAM_START, OP_HELLO_SYN, OP_VIDEO_RESIZE, OP_PING, OP_PONG,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("xpdash-server initializing...");
+    log::info!("=== xpdash-server starting ===");
 
-    // Bind discovery broadcaster
+    // Determine target XP agent address from args or default to 10.0.10.113
+    let agent_ip = std::env::args().nth(1).unwrap_or_else(|| "10.0.10.113".to_string());
+    log::info!("Configured target XP Agent: {}:{}", agent_ip, TCP_CONTROL_PORT);
+
+    // 1. Spawn UDP Discovery Beacon Broadcaster
+    tokio::spawn(async move {
+        if let Err(e) = run_beacon_broadcaster().await {
+            log::warn!("Beacon broadcaster error: {}", e);
+        }
+    });
+
+    // 2. Spawn UDP Media Receiver (Port 7021)
+    tokio::spawn(async move {
+        if let Err(e) = run_media_receiver().await {
+            log::error!("Media receiver error: {}", e);
+        }
+    });
+
+    // 3. Connect to XP Agent Control Channel (Port 7020)
+    let agent_addr: SocketAddr = format!("{}:{}", agent_ip, TCP_CONTROL_PORT).parse()?;
+    log::info!("Connecting to XP Agent control port at {}...", agent_addr);
+
+    let mut stream = match TcpStream::connect(agent_addr).await {
+        Ok(s) => {
+            log::info!("Successfully connected to XP Agent TCP control channel!");
+            s
+        }
+        Err(e) => {
+            log::error!("Failed to connect to XP Agent at {}: {}", agent_addr, e);
+            return Err(e.into());
+        }
+    };
+
+    // Request media streaming start
+    let start_frame = [OP_STREAM_START, 0, 0, 0];
+    stream.write_all(&start_frame).await?;
+    log::info!("Sent OP_STREAM_START to XP Agent");
+
+    // Read control events from agent
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            log::warn!("Control channel closed by agent");
+            break;
+        }
+
+        let mut offset = 0;
+        while offset + TcpFrameHeader::SIZE <= n {
+            if let Some(hdr) = TcpFrameHeader::parse(&buf[offset..]) {
+                let payload_start = offset + TcpFrameHeader::SIZE;
+                let payload_end = payload_start + hdr.payload_len as usize;
+
+                if payload_end <= n {
+                    let payload = &buf[payload_start..payload_end];
+                    handle_agent_control_msg(&hdr, payload, &mut stream).await?;
+                    offset = payload_end;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_agent_control_msg(
+    hdr: &TcpFrameHeader,
+    payload: &[u8],
+    stream: &mut TcpStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match hdr.opcode {
+        OP_HELLO_SYN => {
+            if let Some(syn) = MsgHelloSyn::parse(payload) {
+                log::info!(
+                    "Agent HELLO_SYN: Machine='{}', Res={}x{}@{}bpp, Version={}",
+                    syn.machine_name, syn.screen_width, syn.screen_height, syn.bpp, syn.agent_version
+                );
+            }
+        }
+        OP_VIDEO_RESIZE => {
+            if let Some(resize) = MsgVideoResize::parse(payload) {
+                log::info!(
+                    "Agent VIDEO_RESIZE: New resolution: {}x{}@{}bpp",
+                    resize.new_width, resize.new_height, resize.new_bpp
+                );
+            }
+        }
+        OP_PING => {
+            let pong_frame = [OP_PONG, 0, 0, 0];
+            stream.write_all(&pong_frame).await?;
+        }
+        _ => {
+            log::debug!("Received opcode 0x{:02X}, len {}", hdr.opcode, hdr.payload_len);
+        }
+    }
+    Ok(())
+}
+
+async fn run_beacon_broadcaster() -> Result<(), Box<dyn std::error::Error>> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.set_broadcast(true)?;
 
     let target: SocketAddr = format!("255.255.255.255:{}", UDP_BEACON_PORT).parse()?;
-
     log::info!(
         "Broadcasting LAN discovery beacons on UDP {} -> Control: {}, Media: {}",
         UDP_BEACON_PORT, TCP_CONTROL_PORT, UDP_MEDIA_PORT
     );
 
-    let mut beacon = Vec::with_capacity(64);
-    beacon.extend_from_slice(b"XPD\x01");
-    beacon.extend_from_slice(&TCP_CONTROL_PORT.to_le_bytes());
-    beacon.extend_from_slice(&UDP_MEDIA_PORT.to_le_bytes());
-    beacon.push(0); // Name length
-    beacon.push(6);
-    beacon.extend_from_slice(b"XPDash");
+    let beacon = DiscoveryBeacon {
+        control_port: TCP_CONTROL_PORT,
+        media_port: UDP_MEDIA_PORT,
+        server_name: "xpdash-server".to_string(),
+        fingerprint: [0x58; 32],
+    };
+    let payload = beacon.encode();
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         interval.tick().await;
-        let _ = socket.send_to(&beacon, target).await;
-        log::debug!("Sent discovery beacon");
+        let _ = socket.send_to(&payload, target).await;
+    }
+}
+
+struct PartialFrame {
+    width: u16,
+    height: u16,
+    total_chunks: u16,
+    received_chunks: HashMap<u16, Vec<u8>>,
+    _pts_ms: u32,
+}
+
+async fn run_media_receiver() -> Result<(), Box<dyn std::error::Error>> {
+    let std_sock = std::net::UdpSocket::bind(format!("0.0.0.0:{}", UDP_MEDIA_PORT))?;
+    let sock2 = socket2::SockRef::from(&std_sock);
+    let _ = sock2.set_recv_buffer_size(8 * 1024 * 1024);
+    std_sock.set_nonblocking(true)?;
+    let socket = UdpSocket::from_std(std_sock)?;
+    log::info!("Media receiver bound on UDP 0.0.0.0:{} (8MB socket buffer)", UDP_MEDIA_PORT);
+    let mut buf = [0u8; 2048];
+    let mut audio_clock = PtsClock::new(20);
+    let mut _video_clock = PtsClock::new(30);
+
+    let mut frames: HashMap<u32, PartialFrame> = HashMap::new();
+    let mut last_stats_print = Instant::now();
+    let mut total_audio_bytes: u64 = 0;
+    let mut total_video_frames: u64 = 0;
+    let mut dropped_audio_slices: u64 = 0;
+    let dropped_video_chunks: u64 = 0;
+
+    loop {
+        let (len, _src) = socket.recv_from(&mut buf).await?;
+        if len < NetPacketHeader::SIZE {
+            continue;
+        }
+
+        if let Some((nh, payload)) = NetPacketHeader::parse(&buf[..len]) {
+            match nh.pkt_type {
+                PacketType::Audio => {
+                    if !audio_clock.is_packet_acceptable(nh.pts_ms) {
+                        dropped_audio_slices += 1;
+                        continue;
+                    }
+
+                    if let Some((_ah, pcm_data)) = AudioSliceHeader::parse(payload) {
+                        total_audio_bytes += pcm_data.len() as u64;
+                    }
+                }
+                PacketType::Video => {
+                    if let Some((vh, chunk_data)) = VideoChunkHeader::parse(payload) {
+                        let entry = frames.entry(vh.frame_index).or_insert_with(|| PartialFrame {
+                            width: vh.frame_width,
+                            height: vh.frame_height,
+                            total_chunks: vh.total_chunks,
+                            received_chunks: HashMap::new(),
+                            _pts_ms: nh.pts_ms,
+                        });
+
+                        entry.received_chunks.insert(vh.chunk_index, chunk_data.to_vec());
+
+                        if entry.received_chunks.len() == entry.total_chunks as usize {
+                            // Reassemble complete compressed frame
+                            let mut full_comp = Vec::new();
+                            for c in 0..entry.total_chunks {
+                                if let Some(chunk) = entry.received_chunks.get(&c) {
+                                    full_comp.extend_from_slice(chunk);
+                                }
+                            }
+
+                            // Decompress LZ4
+                            if vh.codec == 2 {
+                                let expected_uncompressed = (entry.width as usize) * (entry.height as usize) * 4;
+                                match lz4_flex::decompress(&full_comp, expected_uncompressed) {
+                                    Ok(_decomp) => {
+                                        total_video_frames += 1;
+                                        log::info!(
+                                            "Successfully decoded Video Frame #{} ({}x{}, {} chunks, comp={} KB, raw={} KB)",
+                                            vh.frame_index, entry.width, entry.height, entry.total_chunks,
+                                            full_comp.len() / 1024, expected_uncompressed / 1024
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::warn!("LZ4 decompress error on frame {}: {}", vh.frame_index, e);
+                                    }
+                                }
+                            } else {
+                                total_video_frames += 1;
+                            }
+
+                            // Cleanup finished frame
+                            frames.remove(&vh.frame_index);
+                        }
+                    }
+                }
+                PacketType::Ping => {}
+            }
+        }
+
+        // Cleanup stale frames older than 100 frames
+        if frames.len() > 100 {
+            frames.retain(|_, f| f.received_chunks.len() > 0);
+        }
+
+        // Print stats periodically
+        if last_stats_print.elapsed() >= Duration::from_secs(3) {
+            log::info!(
+                "[Stream Stats] Audio: {} KB (dropped: {}), Video Frames Decoded: {} (dropped: {})",
+                total_audio_bytes / 1024,
+                dropped_audio_slices,
+                total_video_frames,
+                dropped_video_chunks
+            );
+            last_stats_print = Instant::now();
+        }
     }
 }
