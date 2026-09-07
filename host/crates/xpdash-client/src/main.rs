@@ -52,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_inner_size([1024.0, 768.0])
                 .with_min_inner_size([640.0, 480.0])
                 .with_active(true),
+            vsync: false, // Decouple paint rate from host monitor — present frames immediately
             ..Default::default()
         };
 

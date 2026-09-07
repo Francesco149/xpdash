@@ -186,163 +186,137 @@ This document serves as the architectural master plan and session-by-session exe
 
 ---
 
-## Session 7: Streaming Performance Overhaul — Moonlight-Grade (PENDING)
+## Session 7: Streaming Engine Overhaul — Moonlight-Grade (IN PROGRESS)
 
-### Problem Statement
-Live testing of the full GUI client against `timemachine` (`10.0.10.113`) running GTA: San Andreas revealed severe performance deficiencies:
-- **~10 FPS video** in-game (should be 60). Desktop never reaches 30.
-- **Invisible mouse cursor** in fullscreen DirectX games.
-- **Geometry flickering** — meshes and HUD elements intermittently vanish in the stream despite being stable on the physical display.
-- **Choppy mouse movement** — cursor updates arrive in bursts rather than smoothly.
-- **Jittery audio** — audible stuttering and micro-gaps during playback.
-- **RTT is healthy** (1–2ms median, occasional 16ms spikes) — network is not the bottleneck.
+### Status After Initial Pass
+The initial bandaid pass (VSync removal, TCP_NODELAY, ring buffer resize, dirty-check reorder) raised desktop FPS from 12 to 50 and fixed audio stuttering. But fundamental problems remain:
+- **Flickering**: GDI `BitBlt` captures the front buffer mid-render. When the D3D9 game is drawing, BitBlt reads a partially composed frame — meshes and HUD elements vanish because they haven't been drawn yet in that frame. No amount of timing adjustments fixes this; it's the wrong capture method.
+- **Mouse choppiness**: egui's `pointer.delta()` only updates once per render frame (~60Hz). Real gaming input needs 125–1000Hz. The mouse path is: OS → winit → egui accumulation → one TCP send per frame. Even with TCP_NODELAY, one 16ms-batched update per frame feels terrible.
+- **"60 FPS but doesn't feel smooth"**: Frame pacing issues — the agent captures at variable intervals, the client presents at VSync-locked intervals. A frame arriving 1ms after VSync waits 15ms for the next paint.
 
-### Root Cause Analysis (8 Issues Identified)
+**These cannot be fixed by tuning BitBlt.** The architecture needs three fundamental changes:
 
-#### Bug 1: VSync Double-Wait Destroys Capture FPS (PRIMARY — ~10 FPS)
-**Files:** `agent/src/video.c:40-54` (`vblank_wait`), `agent/src/video.c:109-129` (`video_worker_thread`)
+---
 
-`vblank_wait()` calls `WaitForVerticalBlank(DDWAITVB_BLOCKEND)` followed by `WaitForVerticalBlank(DDWAITVB_BLOCKBEGIN)`. This blocks the capture thread for **up to 16.7ms per frame** waiting for the XP machine's physical monitor VSync. The video worker loop at line 117 additionally gates on `if (now - last_tick >= 16)`, and the thread does `Sleep(1)` in between — so the effective frame time is `VSync_wait + 16ms_gate + Sleep(1)` ≈ 33ms+ per frame = **~30 FPS ceiling on desktop, much worse in-game**.
+### Architecture: Three Pillars
 
-When a Direct3D game (GTA SA) is running, the GPU is busy with its own VSync/presentation. The DirectDraw `WaitForVerticalBlank` call contends with the game's D3D swapchain, causing the capture thread to stall for **multiple VSync intervals** — hence the observed ~10 FPS.
+#### Pillar 1: D3D9 Present Hook — Zero-Flicker Game Capture
 
-**Fix:** Remove `vblank_wait()` entirely. GDI `BitBlt` reads the front buffer and does not benefit from VSync synchronization. Replace the timing loop with a clean `timeGetTime()` interval of 16ms with `Sleep(1)` spin-wait, no VSync dependency.
+**Why**: Every production game streaming tool (Sunshine, FRAPS, OBS Game Capture, Steam overlay, Discord overlay) hooks `IDirect3DDevice9::Present()`. This is the ONLY way to capture a fully-composed frame without tearing or flicker. The back buffer contains the complete frame right before presentation — no mid-render artifacts possible.
 
-#### Bug 2: Geometry Flickering from GDI Mid-Render Capture
-**Files:** `agent/src/video.c:264-273` (`video_capture` BitBlt call)
+**How it works on Windows XP**:
+1. **Hook DLL (`xpdash-hook.dll`)**: A small DLL (~300 lines of C) that:
+   - On `DllMain(DLL_PROCESS_ATTACH)`, creates a temporary D3D9 device via `Direct3DCreate9()` + `CreateDevice()` to discover the vtable layout.
+   - Patches `IDirect3DDevice9::Present` (vtable index **17**) and `EndScene` (index **42**) via `VirtualProtect` + pointer swap.
+   - In the hooked `Present`:
+     - Calls `GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pSurf)` to get the back buffer surface.
+     - Calls `GetRenderTargetData(pBackBuf, pSysMemSurf)` to copy GPU → system memory (a pre-allocated `D3DPOOL_SYSTEMMEM` offscreen plain surface).
+     - Locks the system memory surface via `LockRect()`, copies pixels to a **named shared memory section** (`CreateFileMapping` / `MapViewOfFile`).
+     - Signals a **named event** (`SetEvent`) to notify the agent a new frame is ready.
+     - Calls the original `Present` to let the game continue normally.
+   - Also hooks `Reset` (vtable index **16**) to release and recreate the system memory surface when the game changes resolution.
 
-GDI `BitBlt(SRCCOPY)` captures the desktop compositor's front buffer. When a Direct3D game is rendering, `BitBlt` can capture **mid-frame** — the display surface may be partially updated by the game's D3D Present call. This manifests as:
-- Meshes or HUD elements being invisible (captured between Clear and Draw).
-- Partial geometry (captured between draw calls within a frame).
+2. **Agent injection (`agent/src/d3d9hook.c`)**: The agent:
+   - Detects running D3D9 games by enumerating processes or by receiving a command.
+   - Injects `xpdash-hook.dll` into the game process via `CreateRemoteThread` + `LoadLibraryA` (standard technique, works on XP).
+   - Opens the named shared memory and event.
+   - The video capture thread switches from BitBlt to reading the shared memory when the hook is active.
+   - Falls back to BitBlt when no D3D9 game is hooked (desktop, DirectDraw games, etc).
 
-The VSync wait was presumably intended to fix this, but it synchronizes with the **monitor scanout**, not with D3D's **Present** call — they are different timing domains.
+3. **Dependencies**: Zero — uses only `d3d9.dll` (already loaded by the game), `kernel32.dll` for shared memory/events, and `user32.dll` for `VirtualProtect`. All stock XP DLLs.
 
-**Fix:** Remove VSync wait (it doesn't help). Add `CAPTUREBLT` flag to `BitBlt` (`SRCCOPY | CAPTUREBLT`) — on Windows XP this additionally captures DirectDraw and Direct3D overlay surfaces. If flickering persists, consider adding a 1-frame delay (capture the previous frame's completed buffer) or investigate `PrintWindow`/mirror driver alternatives. The pragmatic Moonlight approach is to accept occasional tearing artifacts and rely on high frame rate to make them imperceptible (at 60 FPS each frame is 16ms; a torn frame is replaced in the next capture).
+4. **Files**:
+   - `agent/src/d3d9hook_dll.c` — the hook DLL source (cross-compiled to `xpdash-hook.dll`)
+   - `agent/src/d3d9hook.c` / `.h` — agent-side injection, shared memory reader, fallback logic
+   - `agent/src/video.c` — modified to check hook state before BitBlt
 
-#### Bug 3: Mouse Cursor Invisible in DirectX Fullscreen Games
-**Files:** `agent/src/video.c:56-85` (`draw_cursor`)
+5. **Verification**: Inject into GTA SA on `timemachine`. Capture should produce zero-flicker frames at the game's native refresh rate (30–60 FPS depending on the game's own VSync setting). Compare side-by-side with BitBlt captures to confirm no mid-render artifacts.
 
-`draw_cursor()` checks `ci.flags & CURSOR_SHOWING`. In DirectX fullscreen exclusive mode, Windows hides the system cursor (`flags=0`) — the game renders its own cursor via Direct3D. Since the GDI capture may not reliably pick up the D3D-rendered cursor, and the code skips drawing when `CURSOR_SHOWING` is false, the cursor vanishes entirely.
+#### Pillar 2: TurboJPEG Encoding — 10–25× Bandwidth Reduction
 
-**Fix:** Two-part solution:
-1. **Always composite the system cursor** regardless of `CURSOR_SHOWING` flag. Remove the `if (ci.flags & CURSOR_SHOWING)` guard. When the game hides the system cursor, `GetCursorInfo` still returns a valid `hCursor` handle and `ptScreenPos` — call `DrawIconEx` unconditionally.
-2. **Fallback cursor:** If `hCursor` is NULL (rare), load `IDC_ARROW` via `LoadCursor(NULL, IDC_ARROW)` and draw that at the reported position.
-3. **Game cursor duplication concern:** In games that draw their own cursor AND show the system cursor, this would result in double cursors. This is acceptable — the user can toggle cursor compositing in a future session. For GTA SA specifically, the game hides the system cursor, so this is not a concern.
+**Why**: LZ4 is a general-purpose byte compressor. It has no understanding of image structure — it can't exploit spatial redundancy (nearby pixels are similar). Result: 800×600 game frames compress from 1.92 MB to ~1.3 MB (32% compression). JPEG with SSE2-accelerated TurboJPEG at quality 85: same frame compresses to **50–100 KB** (95–97% compression). This means:
+- Bandwidth drops from 500 Mbps to **30–60 Mbps** at 60 FPS — easily within 100 Mbps LAN.
+- Fewer UDP packets per frame (8–15 vs 163) — less sendto() overhead.
+- Lower end-to-end latency — smaller frames transmit faster over the wire.
 
-#### Bug 4: Mouse Input Choppy Due to TCP Nagle's Algorithm
-**Files:** `host/crates/xpdash-client/src/network/session.rs:180-193` (input send), `agent/src/net.c:129-165` (`net_connect_to_server`)
+**How**:
+1. Cross-compile **libjpeg-turbo 2.0.6** (last XP-compatible release) with `i686-w64-mingw32-gcc` + NASM for SSE2 SIMD. Static link `.a` into the agent binary.
+2. Agent: after capturing a frame (from D3D9 hook or BitBlt), encode with `tjCompress2()` at configurable quality (default 85, range 50–100). BGRA→JPEG in one call.
+3. Client: decode with the `image` or `turbojpeg` Rust crate (already has libjpeg-turbo bindings). JPEG→RGBA in one call.
+4. Protocol: add `VIDEO_CODEC_JPEG = 3` alongside existing `VIDEO_CODEC_LZ4 = 2`. Client handles both.
+5. **Quality-bandwidth tradeoff**: Expose quality slider in HUD. Quality 95 for text/desktop (visually lossless, ~150 KB/frame), quality 80 for action games (imperceptible at speed, ~50 KB/frame).
 
-All input events (including high-frequency mouse movements at ~125Hz) are sent over TCP without `TCP_NODELAY`. Nagle's algorithm coalesces small writes — a 12-byte input event packet (4-byte TCP frame header + 8-byte `MsgInputEvent`) is held for up to **40ms** waiting for more data or an ACK. Multiple mouse moves batch into a single TCP segment, arriving as a burst at the agent side and injected all at once. This causes visible cursor jumps.
+**Build integration**: Add libjpeg-turbo to the Nix flake. Cross-compile as a static lib, link into agent. Add `turbojpeg` or `jpeg-decoder` crate to the Rust client.
 
-**Fix:**
-1. **Set `TCP_NODELAY` on both ends.** Agent: `setsockopt(g_client_tcp, IPPROTO_TCP, TCP_NODELAY, ...)` in `net_connect_to_server()` and `net_poll_control()` after `accept()`. Client: `tcp_stream.set_nodelay(true)` in `run_session()` after `TcpStream::connect()`.
-2. **Phase 2 (optional, if TCP_NODELAY is insufficient): Move mouse input to UDP.** Add `PKT_TYPE_INPUT = 0x04` to the UDP media protocol. Mouse moves are idempotent — dropped packets are harmless since the next delta supersedes. This eliminates TCP head-of-line blocking entirely for mouse input. Keep keyboard events on TCP for reliability (key-up must not be lost).
+**Fallback**: Keep LZ4 codec for cases where JPEG isn't suitable (e.g., pixel-art games where lossy artifacts are visible). Codec selection can be automatic (game = JPEG, desktop idle = LZ4 for text sharpness).
 
-#### Bug 5: Audio Jitter from Ring Buffer Overflow/Underflow
-**Files:** `host/crates/xpdash-client/src/audio.rs:24` (ring buffer), `host/crates/xpdash-client/src/network/session.rs:320` (PtsClock), `host/crates/xpdash-client/src/audio.rs:75-83` (`push_pcm16_samples`)
+#### Pillar 3: High-Frequency UDP Input — 125–1000 Hz Mouse
 
-The audio ring buffer is **4,800 f32 samples = 50ms** at 48kHz stereo. The `PtsClock` is configured with `max_jitter_ms: 100`, allowing packets up to 100ms late. This creates a mismatch:
-- Network batching delivers audio packets in bursts (e.g., 4 × 10ms packets arrive simultaneously after a 40ms gap).
-- The ring buffer cannot absorb a 40ms burst (1,920 samples) on top of its existing contents — `try_push()` silently drops excess samples.
-- After the burst, the CPAL consumer drains the buffer and underruns, popping `0.0` (silence) which causes audible clicks and gaps.
+**Why**: Mouse input is currently coupled to the egui render loop via `pointer.delta()`, producing ONE update per frame (~60 Hz). Even with TCP_NODELAY, this is 6–8× slower than a USB mouse's native poll rate (125 Hz default, 1000 Hz for gaming mice). The result is choppy, laggy cursor movement that makes FPS games unplayable.
 
-Additionally, the CPAL callback at `audio.rs:107` does `consumer.try_pop().unwrap_or(0.0)` — a hard transition from audio to silence and back causes clicking. No crossfade or sample-hold is applied.
+**How**:
+1. **Client: Raw device event thread** — Spawn a dedicated OS thread (not tokio, not egui) that reads raw mouse events:
+   - On Linux: Use `libinput` or read `/dev/input/eventN` directly (evdev). This gives per-event resolution at the device's native rate.
+   - On Wayland: Use `zwp_relative_pointer_manager_v1` protocol for locked pointer deltas.
+   - Each raw mouse event is immediately serialized as a `MsgInputEvent` and sent over a **dedicated UDP socket** to the agent.
+2. **Protocol: UDP input channel** — Add `PKT_TYPE_INPUT = 0x04` to the UDP media protocol. Mouse moves are fire-and-forget over UDP (dropped packets are harmless — the next delta supersedes). Keep keyboard events on TCP for reliability (key-up must not be lost).
+3. **Agent: dedicated input receiver** — The agent's UDP media socket already receives audio/video. Add handling for `PKT_TYPE_INPUT` in the same recv loop. Call `SendInput()` immediately on receipt. No TCP poll latency, no Nagle, no head-of-line blocking.
+4. **Fallback**: Keep the existing egui → TCP input path as fallback for platforms where raw input isn't available, or for keyboard-only input.
 
-**Fix:**
-1. **Increase ring buffer to 19,200 samples (200ms).** This absorbs worst-case network burst without overflow: `HeapRb::<f32>::new(19200)`.
-2. **Reduce `PtsClock max_jitter_ms` from 100 to 30.** With 1ms median RTT on LAN, 100ms tolerance allows extremely stale packets that desync audio. 30ms is generous for LAN and matches the ~25ms latency budget.
-3. **Smooth underrun handling:** Replace `unwrap_or(0.0)` with sample-hold (repeat last sample) or micro-fade to zero over 48 samples (1ms). This eliminates click artifacts on transient underruns.
+---
 
-#### Bug 6: Client Frame Copy Overhead (1.92 MB/frame heap allocation)
-**Files:** `host/crates/xpdash-client/src/ui/viewport.rs:55-58` (texture upload), `host/crates/xpdash-client/src/network/session.rs:101-102` (`latest_frame` clone)
+### Implementation Plan (Priority Order)
 
-Every frame paint:
-1. `session.latest_frame()` at `session.rs:101` does `self.latest_frame.read().clone()` — clones `VideoFrame` including `Arc<Vec<u8>>` (cheap Arc bump, but still a read-lock acquisition on every paint).
-2. `viewport.rs:55`: `bytemuck::cast_slice(&frame.rgba_pixels)` followed by `pixels.to_vec()` at line 58 — **copies the entire 1.92 MB pixel buffer into a new `Vec`** every frame to construct `ColorImage`. At 60 FPS this is 115 MB/s of pure memcpy overhead plus heap allocation pressure.
+#### Phase 1: D3D9 Present Hook (Highest Impact — eliminates flickering)
+**New files**: `agent/src/d3d9hook_dll.c`, `agent/src/d3d9hook.c`, `agent/src/d3d9hook.h`
+**Modified files**: `agent/src/video.c`, `agent/src/main.c`, `agent/Makefile`, `agent/build.sh`
+1. Write the hook DLL: `DllMain` → create temp device → discover vtable → hook Present/EndScene/Reset.
+2. Implement shared memory frame buffer (`CreateFileMapping`, 4 MB, double-buffered with producer/consumer index).
+3. Implement agent-side injector: `OpenProcess` → `VirtualAllocEx` → `WriteProcessMemory` (DLL path) → `CreateRemoteThread(LoadLibraryA)`.
+4. Modify `video_capture()`: if hook active, read from shared memory instead of BitBlt. If hook not active, fall back to BitBlt.
+5. Build: separate DLL compilation target in Makefile. Deploy both `xpdash-agent.exe` and `xpdash-hook.dll` to `C:\xpdash\`.
+6. **Verify**: Launch GTA SA on timemachine, inject hook, stream — zero flicker, correct geometry, visible cursor.
 
-**Fix:**
-1. **Eliminate the `to_vec()` copy.** Construct `egui::ColorImage` using the existing `Arc<Vec<u8>>` data directly. `egui::ColorImage` accepts ownership of a `Vec<Color32>` — transmute the `Vec<u8>` into `Vec<Color32>` (safe: both are `#[repr(C)]` 4-byte aligned RGBA) via `bytemuck::allocation::cast_vec` or manual `Vec::from_raw_parts`.
-2. **Swap-buffer instead of RwLock for latest frame.** Replace `Arc<RwLock<Option<VideoFrame>>>` with `arc_swap::ArcSwap<Option<VideoFrame>>` or `std::sync::atomic` pointer swap. The decompression thread stores the new frame; the UI thread loads it. Zero contention, no lock.
+#### Phase 2: TurboJPEG Encoding (Highest bandwidth impact — 10× reduction)
+**Modified files**: `agent/src/video.c`, `agent/src/net.h`, `flake.nix`, `agent/build.sh`
+**New dependency**: libjpeg-turbo 2.0.6 (static `.a`, cross-compiled)
+1. Add libjpeg-turbo 2.0.6 to Nix flake as a cross-compiled package.
+2. Replace `LZ4_compress_fast` in `video_capture()` with `tjCompress2()`. Keep LZ4 as fallback codec.
+3. Add `VIDEO_CODEC_JPEG = 3` to protocol. Update `VideoChunkHeader.codec`.
+4. Client: add JPEG decode path in `run_media_receiver()`. Use `image::codecs::jpeg` or `turbojpeg` crate.
+5. **Verify**: Measure per-frame compressed size. Target: 50–100 KB (vs 1.3 MB with LZ4). Measure FPS improvement from reduced send overhead.
 
-#### Bug 7: Decompression Channel Backpressure Drops Frames
-**Files:** `host/crates/xpdash-client/src/network/session.rs:289,380` (decompress channel)
+#### Phase 3: UDP High-Frequency Input (Smooth mouse)
+**Modified files**: `host/crates/xpdash-client/src/ui/input_handler.rs`, `agent/src/net.c`, `host/crates/xpdash-core/src/lib.rs`
+1. Add `PKT_TYPE_INPUT = 0x04` to protocol.
+2. Client: spawn raw input thread. On Linux, open evdev device for mouse, read `EV_REL` events, send as UDP `PKT_TYPE_INPUT` immediately.
+3. Agent: handle `PKT_TYPE_INPUT` in UDP recv path, call `SendInput()`.
+4. **Verify**: Mouse movement feels native-smooth, no visible quantization or batching.
 
-The decompression channel is a `tokio::sync::mpsc::channel::<CompressedFrame>(8)`. When 8 frames queue up (which happens if decompression is slower than capture), `try_send()` fails and the frame is silently dropped. The decompression worker does LZ4 decompress (fast) + BGRA→RGBA byte swizzle (slow: per-pixel loop at lines 298-304) + write-lock acquisition on `frame_sink` (contends with UI).
+#### Phase 4: Client Frame Pacing (VSync decoupling)
+**Modified files**: `host/crates/xpdash-client/src/main.rs`, `host/crates/xpdash-client/src/ui/viewport.rs`
+1. Set `eframe::NativeOptions { vsync: false }` for immediate frame presentation.
+2. Implement frame-latest-wins: when a new frame arrives from decompression, present it at the next paint. Never hold a stale frame waiting for VSync.
+3. **Verify**: Smooth motion in stream, no frame pacing hitches.
 
-**Fix:**
-1. **Use channel capacity 2, not 8.** We only care about the latest frame. With 8 slots, the decompressor can fall 8 frames behind, adding ~133ms of latency.
-2. **Replace the byte swizzle loop with SIMD or batch swap.** The BGRA→RGBA conversion iterates every pixel: `for chunk in rgba.chunks_exact_mut(4) { swap B and R }`. At 800×600 = 480,000 pixels this is ~1.9M byte operations. Use `chunks_exact_mut(8)` with manual u64 byte manipulation, or `rgba.chunks_exact_mut(4).for_each(|c| c.swap(0, 2))` which the compiler auto-vectorizes with `-C target-cpu=native`.
-3. **Replace `frame_sink.write()` with atomic swap** (see Bug 6 fix).
+### Success Criteria (Revised)
+- **Zero flicker** in D3D9 games (GTA SA, Half-Life 2, Quake III, etc).
+- **≥50 FPS** in-game streaming at 800×600.
+- **Mouse latency ≤10ms** end-to-end (raw device → agent injection).
+- **Bandwidth ≤60 Mbps** at 60 FPS 800×600 (JPEG quality 85).
+- **Audio**: Zero drops, ≤3ms jitter.
+- **Cursor**: Always visible in both desktop and fullscreen game modes.
+- Competitive with Moonlight/Sunshine, accounting for no hardware encoder.
 
-#### Bug 8: No Continuous Repaint Scheduling (egui VSync coupling)
-**Files:** `host/crates/xpdash-client/src/ui/viewport.rs:121` (`ctx.request_repaint()`)
-
-`ctx.request_repaint()` asks egui for a repaint "as soon as possible" but eframe couples this to the host monitor's VSync by default. If the host runs at 60Hz, this is fine. But if the host compositor introduces frame skipping or the VSync phase doesn't align with incoming stream frames, frames are delayed by up to one VSync period.
-
-**Fix:** Call `ctx.request_repaint_after(Duration::ZERO)` or set `eframe::NativeOptions::vsync = false` to decouple paint rate from host VSync. The GPU texture upload is cheap (~0.5ms for 1.92 MB) and doesn't need VSync alignment.
-
-### Implementation Plan (5 Phases, Priority Order)
-
-#### Phase 1: Agent Video Capture Fix (Highest Impact — 10 FPS → 60 FPS)
-**Target files:** `agent/src/video.c`
-1. Remove `vblank_wait()` call from `video_capture()` (line 264). Keep `vblank_init()` / `vblank_wait()` functions but ifdef them out for future optional use.
-2. Add `CAPTUREBLT` flag: change `BitBlt(... SRCCOPY)` to `BitBlt(... SRCCOPY | CAPTUREBLT)` at line 266.
-3. Fix cursor compositing: remove `if (ci.flags & CURSOR_SHOWING)` guard in `draw_cursor()`. Always call `DrawIconEx` if `GetCursorInfo` succeeds and `ci.hCursor` is non-NULL. Add `LoadCursor(NULL, IDC_ARROW)` fallback.
-4. Clean up video worker loop: replace `if (now - last_tick >= 16)` with cleaner 16ms interval tracking that doesn't drift.
-**Build:** `nix develop --command bash agent/build.sh`
-**Deploy:** `deploy/deploy-timemachine.sh`
-**Verify:** Connect client, observe FPS counter in HUD. Target: ≥30 FPS desktop, ≥25 FPS in GTA SA. Cursor visible.
-
-#### Phase 2: Network Input Latency Fix (Mouse Choppiness)
-**Target files:** `agent/src/net.c`, `host/crates/xpdash-client/src/network/session.rs`
-1. Agent: add `setsockopt(TCP_NODELAY)` immediately after `connect()` in `net_connect_to_server()` (line 156) and after `accept()` in `net_poll_control()` (line 367).
-2. Client: add `tcp_stream.set_nodelay(true)?;` after `TcpStream::connect()` in `run_session()` (line 149).
-**Verify:** Move mouse in stream — should track smoothly without visible jumps/batching.
-
-#### Phase 3: Audio Pipeline Fix (Jittery Audio)
-**Target files:** `host/crates/xpdash-client/src/audio.rs`, `host/crates/xpdash-client/src/network/session.rs`
-1. Change ring buffer from `HeapRb::<f32>::new(4800)` to `HeapRb::<f32>::new(19200)` in `AudioController::new()`.
-2. Change `PtsClock::new(100)` to `PtsClock::new(30)` in `run_media_receiver()`.
-3. Replace `consumer.try_pop().unwrap_or(0.0)` in the CPAL callback with sample-hold: track `last_sample` and return it on underrun instead of 0.0. Add a 1ms fade-to-zero if underrun persists for more than 480 samples.
-**Verify:** Play GTA SA, listen for audio stuttering. Should be clean continuous playback.
-
-#### Phase 4: Client Rendering Optimization (Frame Drops & Copies)
-**Target files:** `host/crates/xpdash-client/src/ui/viewport.rs`, `host/crates/xpdash-client/src/network/session.rs`, `host/crates/xpdash-client/src/audio.rs`
-1. Eliminate `pixels.to_vec()` in viewport texture upload. Use `bytemuck::cast_vec` or unsafe `Vec::from_raw_parts` to reinterpret `Vec<u8>` as `Vec<Color32>` without copying.
-2. Replace `Arc<RwLock<Option<VideoFrame>>>` with `arc_swap::ArcSwap` for lock-free frame handoff between decompression thread and UI thread. Add `arc-swap = "1"` to `Cargo.toml`.
-3. Reduce decompression channel from `channel::<CompressedFrame>(8)` to `channel::<CompressedFrame>(2)`.
-4. Optimize BGRA→RGBA swizzle: ensure the byte-swap loop uses `.swap(0, 2)` which auto-vectorizes, or use `unsafe` SIMD intrinsics.
-5. Consider setting `eframe::NativeOptions { vsync: false, .. }` for decoupled paint rate.
-**Verify:** Observe FPS counter — should match or exceed agent capture rate. No visible frame drops.
-
-#### Phase 5: Integration Verification on `timemachine`
-1. Build updated agent: `nix develop --command bash agent/build.sh`
-2. Deploy: `deploy/deploy-timemachine.sh`
-3. Build updated client: `cargo build --release -p xpdash-client`
-4. Launch GTA: San Andreas on `timemachine`.
-5. Connect client and verify:
-   - **FPS:** ≥30 in-game, ≥45 on desktop (target 60).
-   - **Cursor:** Visible in both desktop and in-game modes.
-   - **Geometry:** No flickering of meshes or HUD elements.
-   - **Mouse:** Smooth tracking, no visible batching or jumps.
-   - **Audio:** Clean continuous playback, no stuttering or clicks.
-   - **RTT:** Should remain 1–2ms (unchanged from current).
-   - **Bitrate:** Monitor for bandwidth regression (current ~11.8 Mbps).
-6. If Phase 1–4 achieve ≥30 FPS but not 60, investigate:
-   - Agent-side `BitBlt` cost profiling via `timeGetTime` bracketing.
-   - LZ4 compression cost per frame — consider `LZ4_compress_fast` with acceleration=2 (faster, slightly worse ratio).
-   - Whether the i7-4790K in `timemachine` can sustain 60 FPS BitBlt + LZ4 at 800×600.
-   - Alternative capture: Mirror driver or DirectX hook (session 12+ scope if needed).
-
-### Success Criteria
-- Desktop streaming: ≥45 FPS, smooth mouse, no flickering.
-- GTA SA streaming: ≥25 FPS, visible cursor, clean audio, no geometry artifacts.
-- Competitive with Moonlight/Sunshine on equivalent hardware (accounting for the XP/GDI capture limitation vs. modern NVENC).
-
-### Non-Goals (Deferred)
-- Hardware video encoding (NVENC/VCE) — the XP machines have no hardware encoder.
-- DirectX hooking for pixel-perfect capture — complex, game-specific, deferred to a future session if GDI+CAPTUREBLT proves insufficient.
-- UDP input channel — implement only if TCP_NODELAY doesn't resolve mouse choppiness.
+### What We Keep From Initial Pass
+- ✅ VSync wait removed from agent capture loop.
+- ✅ TCP_NODELAY on both ends.
+- ✅ Audio ring buffer 200ms with sample-hold underrun handling.
+- ✅ PtsClock max_jitter_ms reduced to 30ms.
+- ✅ Cursor compositing fix (always draw, IDC_ARROW fallback).
+- ✅ Dirty check ordering fix (check before cursor draw).
+- ✅ Zero-copy viewport texture upload (bytemuck::cast_vec).
+- ✅ 8KB UDP chunk size for fewer sendto() syscalls.
 
 
 ## Future Sessions (Sessions 8 to 11): Advanced Input, Shaders & Packaging

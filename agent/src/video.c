@@ -3,6 +3,7 @@
 #include "lz4.h"
 #include "log.h"
 #include "net.h"
+#include "d3d9hook.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <mmsystem.h>
@@ -39,9 +40,11 @@ static void vblank_init(void) {
 
 static void vblank_wait(void) {
     if (g_pdd) {
-        // Wait for current vertical blank to complete, then wait for the start of the next blank.
-        // This ensures capture begins exactly at the start of scanline 0.
-        g_pdd->lpVtbl->WaitForVerticalBlank(g_pdd, DDWAITVB_BLOCKEND, NULL);
+        /* Wait for the next vertical blanking interval to begin.
+           During VBlank the front buffer is stable — Present() has
+           completed and the game hasn't started drawing the next frame.
+           Single BLOCKBEGIN is sufficient; the double-wait pattern
+           (BLOCKEND then BLOCKBEGIN) costs an extra VSync period. */
         HRESULT hr = g_pdd->lpVtbl->WaitForVerticalBlank(g_pdd, DDWAITVB_BLOCKBEGIN, NULL);
         if (FAILED(hr)) {
             static int s_logged_vb_fail = 0;
@@ -115,24 +118,22 @@ static volatile int g_video_running = 0;
 
 static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
     (void)lpParam;
-    agent_log("video_worker_thread: capture thread started");
-    DWORD next_tick = timeGetTime();
+    agent_log("video_worker_thread: capture thread started (VSync-synced)");
 
     while (g_video_running) {
         if (net_is_streaming_active()) {
-            DWORD now = timeGetTime();
-            if ((int)(now - next_tick) >= 0) {
-                video_capture();
-                /* Schedule next capture 16ms from target, not from now,
-                   to avoid timing drift accumulation. */
-                next_tick += 16;
-                /* If we fell behind by more than 2 frames, reset to avoid burst. */
-                if ((int)(now - next_tick) > 32) {
-                    next_tick = now + 16;
-                }
+            /* VSync-synchronized capture: wait for the vertical blanking
+               interval, then BitBlt immediately. During VBlank the front
+               buffer is stable — the game has finished Present() and hasn't
+               started the next Clear/Draw yet. This eliminates mid-render
+               flicker for all content (desktop, windowed, fullscreen). */
+            if (g_pdd) {
+                vblank_wait();
             } else {
-                Sleep(1);
+                /* No DirectDraw — fall back to fixed interval */
+                Sleep(16);
             }
+            video_capture();
         } else {
             Sleep(50);
         }
@@ -264,6 +265,68 @@ static int is_screen_dirty(void) {
 }
 
 int video_capture(void) {
+    DWORD t0 = timeGetTime();
+    uint32_t now = t0;
+
+    /* ── Path A: D3D9 hook capture (zero-flicker, perfect timing) ──── */
+    if (d3d9hook_is_active()) {
+        uint32_t hook_w = 0, hook_h = 0, hook_idx = 0;
+
+        /* Ensure our pixel buffer can hold the hook's frame */
+        d3d9hook_get_dimensions(&hook_w, &hook_h);
+        if (hook_w > 0 && hook_h > 0 &&
+            ((int)hook_w != g_width || (int)hook_h != g_height)) {
+            video_resize((int)hook_w, (int)hook_h);
+        }
+
+        if (g_pixels && d3d9hook_read_frame(g_pixels, &hook_w, &hook_h,
+                                             &hook_idx, 16)) {
+            g_frame_counter = hook_idx;
+
+            /* Hook frames are always "dirty" — the hook only fires on Present */
+            DWORD t1 = timeGetTime();
+
+            /* Draw cursor onto hooked frame */
+            draw_cursor(g_hdc_mem);
+
+            DWORD t2 = timeGetTime();
+
+            int raw_size = (int)hook_w * (int)hook_h * 4;
+            int comp_size = LZ4_compress_fast((const char *)g_pixels,
+                (char *)g_comp_buf, raw_size, g_comp_buf_cap, 10);
+
+            DWORD t3 = timeGetTime();
+
+            if (comp_size > 0 && g_cb) {
+                uint8_t flags = 0x01;  /* hook frames are always keyframes */
+                uint8_t codec = 2;     /* LZ4 */
+
+                g_cb(g_comp_buf, (uint32_t)comp_size, g_frame_counter,
+                     (uint16_t)hook_w, (uint16_t)hook_h, codec, flags,
+                     now, g_cb_userdata);
+
+                DWORD t4 = timeGetTime();
+                static uint32_t s_hook_timing = 0;
+                s_hook_timing++;
+                if (s_hook_timing >= 120) {
+                    agent_log("frame_timing[hook]: read=%lums cursor=%lums "
+                              "comp=%lums send=%lums total=%lums comp_sz=%d",
+                              (unsigned long)(t1 - t0),
+                              (unsigned long)(t2 - t1),
+                              (unsigned long)(t3 - t2),
+                              (unsigned long)(t4 - t3),
+                              (unsigned long)(t4 - t0), comp_size);
+                    s_hook_timing = 0;
+                }
+            }
+            return 1;
+        }
+        /* Hook active but no new frame this tick — skip, don't fall through
+           to BitBlt which would produce a flickery frame. */
+        return 1;
+    }
+
+    /* ── Path B: GDI BitBlt capture (fallback for desktop / non-D3D) ─ */
     if (!g_hdc_screen || !g_hdc_mem || !g_pixels || !g_comp_buf) {
         static int s_logged_null = 0;
         if (!s_logged_null) {
@@ -274,9 +337,7 @@ int video_capture(void) {
         return 0;
     }
 
-    DWORD t0 = timeGetTime();
-
-    if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY | CAPTUREBLT)) {
+    if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
         static int s_logged_blt_fail = 0;
         if (!s_logged_blt_fail) {
             agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
@@ -287,7 +348,6 @@ int video_capture(void) {
 
     DWORD t1 = timeGetTime();
 
-    uint32_t now = timeGetTime();
     g_frame_counter++;
 
     int is_keyframe = g_force_keyframe || ((g_frame_counter % KEYFRAME_INTERVAL) == 0);
@@ -332,7 +392,7 @@ int video_capture(void) {
         static uint32_t s_timing_accum = 0;
         s_timing_accum++;
         if (s_timing_accum >= 120) {
-            agent_log("frame_timing: blt=%lums comp=%lums send=%lums total=%lums comp_sz=%d",
+            agent_log("frame_timing[blt]: blt=%lums comp=%lums send=%lums total=%lums comp_sz=%d",
                       (unsigned long)(t1 - t0), (unsigned long)(t3 - t2),
                       (unsigned long)(t4 - t3), (unsigned long)(t4 - t0), comp_size);
             s_timing_accum = 0;

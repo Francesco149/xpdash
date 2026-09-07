@@ -7,7 +7,7 @@ cd "$ROOT"
 
 XP="${1:-10.0.10.113}"
 
-echo "=== Building xpdash-agent.exe ==="
+echo "=== Building xpdash-agent.exe and xpdash-hook.dll ==="
 nix develop --command bash agent/build.sh
 
 echo "=== Deploying to $XP (C:\xpdash\) ==="
@@ -21,6 +21,7 @@ mkdir \\xpdash;
 cd \\xpdash;
 lcd agent/bin;
 put xpdash-agent.exe;
+put xpdash-hook.dll;
 lcd ../../deploy;
 put agent.ini;
 "

@@ -11,6 +11,7 @@
 #include "net.h"
 #include "discover.h"
 #include "log.h"
+#include "d3d9hook.h"
 
 static volatile int g_running = 1;
 static HWND g_hwnd = NULL;
@@ -33,6 +34,12 @@ static void on_stream_state(int is_streaming, void *user_data) {
     agent_log("on_stream_state: streaming=%d", is_streaming);
     if (is_streaming) {
         video_force_keyframe();
+        /* Attempt D3D9 hook injection when streaming starts.
+           If a D3D9 game is running, this hooks Present() for
+           flicker-free capture. If no game is running, this is a no-op. */
+        if (!d3d9hook_is_active()) {
+            d3d9hook_inject("C:\\xpdash\\xpdash-hook.dll", 0);
+        }
     }
 }
 
@@ -98,6 +105,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     net_listen_control(NET_TCP_CONTROL_PORT);
     discover_init(on_server_discovered, NULL);
+    d3d9hook_init();
     audio_init(on_audio_frame, NULL);
     audio_start();
     video_init(on_video_frame, NULL);
@@ -122,6 +130,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     agent_log("Exiting main loop, shutting down subsystems");
+    d3d9hook_shutdown();
     video_shutdown();
     audio_shutdown();
     discover_shutdown();
