@@ -1,0 +1,14 @@
+[package]
+name = "xpdash-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+xpdash-core = { path = "../xpdash-core" }
+tokio.workspace = true
+log.workspace = true
+env_logger.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true

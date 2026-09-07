@@ -1,0 +1,12 @@
+[package]
+name = "xpdash-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+byteorder.workspace = true
+serde.workspace = true
+log.workspace = true
+sha2.workspace = true

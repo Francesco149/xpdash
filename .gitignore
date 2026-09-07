@@ -1,0 +1,25 @@
+# target directories
+target/
+build/
+*.exe
+*.o
+*.a
+*.dll
+*.log
+*.out
+*.raw
+*.wav
+
+# rust
+Cargo.lock
+**/*.rs.bk
+
+# configs with secrets
+boxes.ini
+trusted_servers.ini
+
+# temp
+/tmp/
+.direnv/
+result
+result-*
