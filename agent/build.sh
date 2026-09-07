@@ -40,17 +40,17 @@ echo "[+] Successfully built bin/xpdash-hook.dll ($(stat -c%s bin/xpdash-hook.dl
 # ─── 2. Build xpdash-agent.exe (main agent) ─────────────────────────────
 echo "[*] Compiling xpdash-agent.exe with $CC..."
 "$CC" -O2 -s -mwindows -Wall -Wextra -Wno-unused-parameter \
-    -D_WIN32_WINNT=0x0501 -Isrc \
+    -D_WIN32_WINNT=0x0501 -Isrc -Iinclude \
     -no-pie -static -static-libgcc \
     -Wl,--major-subsystem-version=5,--minor-subsystem-version=1 \
     src/main.c src/audio.c src/video.c src/input.c src/net.c \
     src/discover.c src/lz4.c src/log.c src/sha256.c src/d3d9hook.c \
     -o bin/xpdash-agent.exe \
+    -Llib -lturbojpeg \
     -lws2_32 -lwinmm -lgdi32 -luser32 -ladvapi32 -lshell32
 
-# Check imported DLLs for XP-safety (agent)
 bad="$("$OBJDUMP" -p bin/xpdash-agent.exe | awk '/DLL Name/{print $3}' \
-        | grep -ivE '^(KERNEL32|USER32|ADVAPI32|SHELL32|WS2_32|GDI32|WINMM|msvcrt)\.dll$' || true)"
+        | grep -ivE '^(KERNEL32|USER32|ADVAPI32|SHELL32|WS2_32|GDI32|WINMM|msvcrt|ntdll)\.dll$' || true)"
 
 if [ -n "$bad" ]; then
     echo "[!] Warning: xpdash-agent.exe non-stock XP imports:"

@@ -12,7 +12,7 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use xpdash_core::{
     AudioSliceHeader, MsgHelloSyn, MsgInputEvent, MsgVideoResize, NetPacketHeader, PacketType,
-    PtsClock, TcpFrameHeader, VideoChunkHeader, OP_HELLO_SYN, OP_INPUT_EVENT, OP_PING, OP_PONG,
+    PtsClock, TcpFrameHeader, VideoChunkHeader, OP_HELLO_SYN, OP_PING, OP_PONG,
     OP_STREAM_START, OP_VIDEO_RESIZE, TCP_CONTROL_PORT, UDP_MEDIA_PORT,
 };
 
@@ -149,6 +149,12 @@ async fn run_session(
     tcp_stream.set_nodelay(true)?;
     log::info!("Connected to agent control port {} (TCP_NODELAY enabled).", agent_addr);
 
+    // Create UDP socket for high-frequency input (bypasses TCP head-of-line blocking)
+    let input_udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    let input_target: SocketAddr = format!("{}:{}", agent_ip, UDP_MEDIA_PORT).parse()?;
+    input_udp.connect(input_target).await?;
+    log::info!("UDP input socket connected to {} for low-latency input.", input_target);
+
     // Request stream start
     let start_msg = [OP_STREAM_START, 0, 0, 0];
     tcp_stream.write_all(&start_msg).await?;
@@ -179,17 +185,14 @@ async fn run_session(
             }
 
             Some(ev) = input_rx.recv() => {
+                // Send input as a lightweight UDP datagram: [magic(1)][pkt_type(1)][MsgInputEvent(8)]
+                let mut udp_buf = [0u8; 2 + MsgInputEvent::SIZE];
+                udp_buf[0] = 0x58; // MAGIC
+                udp_buf[1] = 0x04; // PKT_TYPE_INPUT
                 let mut ev_buf = [0u8; MsgInputEvent::SIZE];
                 if ev.encode(&mut ev_buf) {
-                    let mut frame_buf = [0u8; TcpFrameHeader::SIZE + MsgInputEvent::SIZE];
-                    let fhdr = TcpFrameHeader {
-                        opcode: OP_INPUT_EVENT,
-                        reserved: 0,
-                        payload_len: MsgInputEvent::SIZE as u16,
-                    };
-                    fhdr.encode(&mut frame_buf[..TcpFrameHeader::SIZE]);
-                    frame_buf[TcpFrameHeader::SIZE..].copy_from_slice(&ev_buf);
-                    let _ = tcp_stream.write_all(&frame_buf).await;
+                    udp_buf[2..].copy_from_slice(&ev_buf);
+                    let _ = input_udp.send(&udp_buf).await;
                 }
             }
 
@@ -292,26 +295,52 @@ async fn run_media_receiver(
     let metrics_worker = metrics.clone();
 
     tokio::task::spawn_blocking(move || {
+        use zune_jpeg::JpegDecoder;
+        use std::io::Cursor;
+
         while let Some(item) = decompress_rx.blocking_recv() {
-            if item.codec == 2 {
+            let mut rgba: Option<Vec<u8>> = None;
+
+            if item.codec == 1 {
+                // JPEG decode (TurboJPEG from agent)
+                let cursor = Cursor::new(&item.compressed_data[..]);
+                let mut decoder = JpegDecoder::new(cursor);
+                if let Ok(pixels) = decoder.decode() {
+                    // zune-jpeg decodes to RGB by default; convert to RGBA
+                    let pixel_count = (item.width as usize) * (item.height as usize);
+                    if pixels.len() >= pixel_count * 3 {
+                        let mut out = Vec::with_capacity(pixel_count * 4);
+                        for chunk in pixels.chunks_exact(3) {
+                            out.push(chunk[0]); // R
+                            out.push(chunk[1]); // G
+                            out.push(chunk[2]); // B
+                            out.push(255);      // A
+                        }
+                        rgba = Some(out);
+                    }
+                }
+            } else if item.codec == 2 {
+                // LZ4 decode
                 let uncompressed_len = (item.width as usize) * (item.height as usize) * 4;
-                if let Ok(mut rgba) = lz4_flex::decompress(&item.compressed_data, uncompressed_len) {
-                    // BGRA → RGBA byte swap (auto-vectorizes with -C target-cpu=native)
-                    for chunk in rgba.chunks_exact_mut(4) {
+                if let Ok(mut bgra) = lz4_flex::decompress(&item.compressed_data, uncompressed_len) {
+                    // BGRA → RGBA byte swap
+                    for chunk in bgra.chunks_exact_mut(4) {
                         chunk.swap(0, 2);
                         chunk[3] = 255;
                     }
-
-                    let frame = VideoFrame {
-                        width: item.width,
-                        height: item.height,
-                        frame_index: item.frame_index,
-                        rgba_pixels: Arc::new(rgba),
-                    };
-
-                    *frame_sink.write() = Some(frame);
-                    metrics_worker.write().video_frames_rx += 1;
+                    rgba = Some(bgra);
                 }
+            }
+
+            if let Some(pixels) = rgba {
+                let frame = VideoFrame {
+                    width: item.width,
+                    height: item.height,
+                    frame_index: item.frame_index,
+                    rgba_pixels: Arc::new(pixels),
+                };
+                *frame_sink.write() = Some(frame);
+                metrics_worker.write().video_frames_rx += 1;
             }
         }
     });

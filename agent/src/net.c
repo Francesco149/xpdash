@@ -79,11 +79,26 @@ int net_init(void) {
         return 0;
     }
 
+    /* Bind to media port so we can both send media AND receive input */
+    struct sockaddr_in udp_addr;
+    memset(&udp_addr, 0, sizeof(udp_addr));
+    udp_addr.sin_family = AF_INET;
+    udp_addr.sin_addr.s_addr = INADDR_ANY;
+    udp_addr.sin_port = htons(NET_UDP_MEDIA_PORT);
+    if (bind(g_sock_udp, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) != 0) {
+        agent_log("net_init: UDP bind to port %d failed, err=%d", NET_UDP_MEDIA_PORT, WSAGetLastError());
+        /* Non-fatal: sending still works, just no UDP input receive */
+    }
+
+    /* Non-blocking so poll doesn't stall */
+    u_long nb = 1;
+    ioctlsocket(g_sock_udp, FIONBIO, &nb);
+
     InitializeCriticalSection(&g_cs_udp);
     int sndbuf = 2 * 1024 * 1024;
     setsockopt(g_sock_udp, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof(sndbuf));
 
-    agent_log("net_init: Winsock and UDP socket ready");
+    agent_log("net_init: Winsock and UDP socket ready (bound port %d)", NET_UDP_MEDIA_PORT);
     return 1;
 }
 
@@ -418,6 +433,49 @@ void net_poll_control(net_stream_state_cb on_state_change, void *user_data) {
                 g_is_authenticated = 0;
                 g_tcp_buf_len = 0;
                 if (on_state_change) on_state_change(0, user_data);
+            }
+        }
+    }
+}
+
+void net_poll_udp_input(void) {
+    if (g_sock_udp == INVALID_SOCKET) return;
+
+    /* Drain all pending UDP input datagrams without blocking */
+    uint8_t buf[64];
+    struct sockaddr_in from_addr;
+    int from_len;
+
+    for (int batch = 0; batch < 64; batch++) {
+        from_len = sizeof(from_addr);
+        int n = recvfrom(g_sock_udp, (char *)buf, sizeof(buf), 0,
+                         (struct sockaddr *)&from_addr, &from_len);
+        if (n <= 0) break;
+
+        /* Minimal validation: magic + pkt_type + at least sizeof(MsgInputEvent) payload */
+        if (n < 3 || buf[0] != PKT_MAGIC) continue;
+
+        if (buf[1] == PKT_TYPE_INPUT) {
+            /* Layout: [magic(1)][pkt_type(1)][MsgInputEvent(8)] = 10 bytes */
+            if (n >= 2 + (int)sizeof(MsgInputEvent)) {
+                const MsgInputEvent *ev = (const MsgInputEvent *)(buf + 2);
+                switch (ev->event_type) {
+                    case INPUT_TYPE_KEY:
+                        input_inject_key(ev->param1, ev->key_down, 0);
+                        break;
+                    case INPUT_TYPE_MOUSE_REL:
+                        input_inject_mouse_rel(ev->param2, ev->param3);
+                        break;
+                    case INPUT_TYPE_MOUSE_ABS:
+                        input_inject_mouse_abs((uint16_t)ev->param2, (uint16_t)ev->param3);
+                        break;
+                    case INPUT_TYPE_MOUSE_BTN:
+                        input_inject_mouse_btn(ev->param1);
+                        break;
+                    case INPUT_TYPE_MOUSE_WHEEL:
+                        input_inject_mouse_wheel((int16_t)ev->param1);
+                        break;
+                }
             }
         }
     }

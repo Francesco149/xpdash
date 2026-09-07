@@ -4,6 +4,7 @@
 #include "log.h"
 #include "net.h"
 #include "d3d9hook.h"
+#include <turbojpeg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <mmsystem.h>
@@ -94,7 +95,8 @@ static void draw_cursor(HDC hdc) {
     }
 }
 #define TILE_SIZE 64
-#define KEYFRAME_INTERVAL 60
+#define KEYFRAME_INTERVAL 120
+#define JPEG_QUALITY 85
 
 static HDC g_hdc_screen = NULL;
 static HDC g_hdc_mem = NULL;
@@ -112,6 +114,8 @@ static int g_force_keyframe = 1;
 
 static video_frame_cb g_cb = NULL;
 static void *g_cb_userdata = NULL;
+
+static tjhandle g_tj = NULL;     /* TurboJPEG compressor instance */
 
 static HANDLE g_h_video_thread = NULL;
 static volatile int g_video_running = 0;
@@ -200,7 +204,10 @@ int video_resize(int new_width, int new_height) {
     }
     memset(g_prev_pixels, 0, raw_size);
 
-    int max_comp_size = LZ4_compressBound(raw_size);
+    /* Size comp_buf for worst-case of both codecs */
+    unsigned long jpeg_max = tjBufSize(g_width, g_height, TJSAMP_420);
+    int lz4_max = LZ4_compressBound(raw_size);
+    int max_comp_size = (int)jpeg_max > lz4_max ? (int)jpeg_max : lz4_max;
     if (max_comp_size > g_comp_buf_cap) {
         if (g_comp_buf) free(g_comp_buf);
         g_comp_buf = (uint8_t *)malloc(max_comp_size);
@@ -246,6 +253,13 @@ int video_init(video_frame_cb callback, void *user_data) {
     g_hdc_mem = CreateCompatibleDC(g_hdc_screen);
     agent_log("video_init: CreateCompatibleDC = %p", g_hdc_mem);
     vblank_init();
+    /* Initialize TurboJPEG compressor for JPEG video encoding */
+    g_tj = tjInitCompress();
+    if (!g_tj) {
+        agent_log("video_init: tjInitCompress failed!");
+        return 0;
+    }
+    agent_log("video_init: TurboJPEG compressor initialized");
     if (!g_hdc_mem) {
         agent_log("CreateCompatibleDC failed! err=%lu", GetLastError());
         return 0;
@@ -291,15 +305,29 @@ int video_capture(void) {
 
             DWORD t2 = timeGetTime();
 
-            int raw_size = (int)hook_w * (int)hook_h * 4;
-            int comp_size = LZ4_compress_fast((const char *)g_pixels,
-                (char *)g_comp_buf, raw_size, g_comp_buf_cap, 10);
+            unsigned long jpeg_size = 0;
+            unsigned char *jpeg_buf = g_comp_buf;
+            int comp_size = 0;
+            uint8_t codec;
+
+            if (g_tj && tjCompress2(g_tj, g_pixels, (int)hook_w, 0, (int)hook_h,
+                                     TJPF_BGRX, &jpeg_buf, &jpeg_size,
+                                     TJSAMP_420, JPEG_QUALITY,
+                                     TJFLAG_FASTDCT | TJFLAG_NOREALLOC) == 0) {
+                comp_size = (int)jpeg_size;
+                codec = 1;  /* VIDEO_CODEC_JPEG */
+            } else {
+                /* JPEG failed — fall back to LZ4 */
+                int raw_size = (int)hook_w * (int)hook_h * 4;
+                comp_size = LZ4_compress_fast((const char *)g_pixels,
+                    (char *)g_comp_buf, raw_size, g_comp_buf_cap, 10);
+                codec = 2;  /* VIDEO_CODEC_LZ4 */
+            }
 
             DWORD t3 = timeGetTime();
 
             if (comp_size > 0 && g_cb) {
                 uint8_t flags = 0x01;  /* hook frames are always keyframes */
-                uint8_t codec = 2;     /* LZ4 */
 
                 g_cb(g_comp_buf, (uint32_t)comp_size, g_frame_counter,
                      (uint16_t)hook_w, (uint16_t)hook_h, codec, flags,
@@ -365,20 +393,35 @@ int video_capture(void) {
     DWORD t2 = timeGetTime();
 
     int raw_size = g_width * g_height * 4;
-    int comp_size = LZ4_compress_fast((const char *)g_pixels, (char *)g_comp_buf,
+    unsigned long jpeg_size = 0;
+    unsigned char *jpeg_buf = g_comp_buf;
+    int comp_size = 0;
+    uint8_t codec;
+
+    if (g_tj && tjCompress2(g_tj, g_pixels, g_width, 0, g_height,
+                             TJPF_BGRX, &jpeg_buf, &jpeg_size,
+                             TJSAMP_420, JPEG_QUALITY,
+                             TJFLAG_FASTDCT | TJFLAG_NOREALLOC) == 0) {
+        comp_size = (int)jpeg_size;
+        codec = 1;  /* VIDEO_CODEC_JPEG */
+    } else {
+        /* JPEG failed — fall back to LZ4 */
+        comp_size = LZ4_compress_fast((const char *)g_pixels, (char *)g_comp_buf,
                                       raw_size, g_comp_buf_cap, 10);
+        codec = 2;  /* VIDEO_CODEC_LZ4 */
+    }
 
     DWORD t3 = timeGetTime();
 
     static int s_logged_first_frame = 0;
     if (!s_logged_first_frame) {
-        agent_log("video_capture: first frame encoded! raw=%d, comp=%d, cb=%p", raw_size, comp_size, g_cb);
+        agent_log("video_capture: first frame encoded! raw=%d, comp=%d, codec=%d, cb=%p",
+                  raw_size, comp_size, codec, g_cb);
         s_logged_first_frame = 1;
     }
 
     if (comp_size > 0 && g_cb) {
         uint8_t flags = is_keyframe ? 0x01 : 0x00;
-        uint8_t codec = 2; // Fast LZ4
 
         g_cb(g_comp_buf, (uint32_t)comp_size, g_frame_counter,
              (uint16_t)g_width, (uint16_t)g_height, codec, flags, now, g_cb_userdata);
@@ -424,6 +467,10 @@ void video_shutdown(void) {
         free(g_comp_buf);
         g_comp_buf = NULL;
         g_comp_buf_cap = 0;
+    }
+    if (g_tj) {
+        tjDestroy(g_tj);
+        g_tj = NULL;
     }
     if (g_hdc_screen) {
         ReleaseDC(NULL, g_hdc_screen);

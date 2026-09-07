@@ -25,6 +25,8 @@
             pkgs.cargo
             pkgs.rustc
             pkgs.pkg-config
+            pkgs.nasm
+            pkgs.cmake
 
             # Linux host client audio/graphics dev libraries
             pkgs.alsa-lib

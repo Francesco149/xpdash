@@ -125,6 +125,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         discover_poll();
         net_poll_control(on_stream_state, NULL);
+        net_poll_udp_input();
 
         Sleep(1);
     }

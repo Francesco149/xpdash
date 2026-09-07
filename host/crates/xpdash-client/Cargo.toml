@@ -18,3 +18,4 @@ egui.workspace = true
 eframe.workspace = true
 parking_lot = "0.12"
 bytemuck = { version = "1.25", features = ["extern_crate_alloc"] }
+zune-jpeg.workspace = true

@@ -348,7 +348,10 @@ async fn run_media_loop<P: Producer<Item = f32>>(
                                 }
                             }
 
-                            if vh.codec == 2 {
+                            if vh.codec == 1 {
+                                // JPEG - just count, no decode in headless mode
+                                video_frames_rx += 1;
+                            } else if vh.codec == 2 {
                                 let uncompressed_len = (entry.width as usize) * (entry.height as usize) * 4;
                                 if let Ok(_decompressed) = lz4_flex::decompress(&compressed, uncompressed_len) {
                                     video_frames_rx += 1;

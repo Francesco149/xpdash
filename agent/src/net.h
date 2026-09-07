@@ -15,6 +15,7 @@
 #define PKT_TYPE_VIDEO 0x01
 #define PKT_TYPE_AUDIO 0x02
 #define PKT_TYPE_PING  0x03
+#define PKT_TYPE_INPUT 0x04
 
 /* Video Codecs */
 #define VIDEO_CODEC_RAW_RGB 0
@@ -146,6 +147,9 @@ int net_send_video_resize(uint16_t width, uint16_t height, uint8_t bpp);
 
 /* Process control network events */
 void net_poll_control(net_stream_state_cb on_state_change, void *user_data);
+
+/* Poll UDP socket for incoming high-frequency input events from client */
+void net_poll_udp_input(void);
 
 /* Cleanup network resources */
 void net_shutdown(void);
