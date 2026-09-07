@@ -116,7 +116,7 @@ static void CALLBACK waveInProc(HWAVEIN hwi, UINT uMsg, DWORD_PTR dwInstance,
     if (uMsg == WIM_DATA && g_running) {
         WAVEHDR *hdr = (WAVEHDR *)dwParam1;
         if (hdr && hdr->dwBytesRecorded > 0 && g_cb) {
-            uint32_t pts = GetTickCount();
+            uint32_t pts = timeGetTime();
             g_cb((const uint8_t *)hdr->lpData, hdr->dwBytesRecorded, pts, g_cb_userdata);
         }
         if (g_running && hdr) {

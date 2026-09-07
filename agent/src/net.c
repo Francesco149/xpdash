@@ -185,7 +185,7 @@ int net_send_audio(const uint8_t *pcm_data, uint32_t size, uint32_t pts_ms) {
         nh->pkt_type = PKT_TYPE_AUDIO;
         nh->flags = 0;
         nh->seq = g_seq_audio++;
-        nh->pts_ms = pts_ms;
+        nh->pts_ms = pts_ms + (uint32_t)(sub * 5);
         nh->payload_len = (uint16_t)(sizeof(AudioSliceHeader) + this_slice);
         nh->reserved = 0;
 

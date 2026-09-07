@@ -1,7 +1,7 @@
 //! xpdash-core — Shared protocol definitions, packet serialization, and timestamp math.
 
 use byteorder::{ByteOrder, LittleEndian};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub mod security;
 pub use security::{compute_fingerprint, format_fingerprint, HostIdentity};
@@ -413,7 +413,9 @@ pub mod audio {
 pub struct PtsClock {
     base_remote_pts: Option<u32>,
     base_local_instant: Option<Instant>,
+    last_slew_instant: Instant,
     max_jitter_ms: u32,
+    consecutive_late: u32,
 }
 
 impl PtsClock {
@@ -421,15 +423,18 @@ impl PtsClock {
         Self {
             base_remote_pts: None,
             base_local_instant: None,
+            last_slew_instant: Instant::now(),
             max_jitter_ms,
+            consecutive_late: 0,
         }
     }
 
     pub fn reset(&mut self) {
         self.base_remote_pts = None;
         self.base_local_instant = None;
+        self.last_slew_instant = Instant::now();
+        self.consecutive_late = 0;
     }
-
     /// Check if packet with `pts_ms` is late or in sync.
     /// Returns `true` if frame is fresh/acceptable, `false` if late and should be dropped.
     pub fn is_packet_acceptable(&mut self, pts_ms: u32) -> bool {
@@ -438,6 +443,8 @@ impl PtsClock {
         if self.base_remote_pts.is_none() || self.base_local_instant.is_none() {
             self.base_remote_pts = Some(pts_ms);
             self.base_local_instant = Some(now);
+            self.last_slew_instant = now;
+            self.consecutive_late = 0;
             return true;
         }
 
@@ -447,18 +454,41 @@ impl PtsClock {
         let elapsed_local_ms = now.duration_since(base_local).as_millis() as u32;
         let expected_remote_pts = base_remote.wrapping_add(elapsed_local_ms);
 
-        // Check if packet is late by more than max_jitter_ms
-        if pts_ms < expected_remote_pts && (expected_remote_pts - pts_ms) > self.max_jitter_ms {
-            // Late packet: drop to avoid playback lag accumulation
+        let delta = pts_ms as i64 - expected_remote_pts as i64;
+
+        // Check for large forward or backward timestamp jump (e.g. server restart)
+        if delta > 300 || delta < -500 {
+            self.base_remote_pts = Some(pts_ms);
+            self.base_local_instant = Some(now);
+            self.last_slew_instant = now;
+            self.consecutive_late = 0;
+            return true;
+        }
+
+        // Check if packet is late
+        if delta < -(self.max_jitter_ms as i64) {
+            self.consecutive_late += 1;
+            // If we receive sustained late packets, it's clock drift rather than network jitter: resync
+            if self.consecutive_late >= 5 {
+                self.base_remote_pts = Some(pts_ms);
+                self.base_local_instant = Some(now);
+                self.last_slew_instant = now;
+                self.consecutive_late = 0;
+                return true;
+            }
+            // Isolated late packet: drop to preserve bounded latency
             return false;
         }
 
-        // If clock drifted significantly ahead or reset on remote rig, resync baseline
-        if pts_ms > expected_remote_pts + 500 || expected_remote_pts > pts_ms + 1000 {
-            self.base_remote_pts = Some(pts_ms);
-            self.base_local_instant = Some(now);
-        }
+        // Packet is on time
+        self.consecutive_late = 0;
 
+        // Rate-limited baseline slew if remote clock runs faster than local clock.
+        // Max 1ms adjustment every 500ms prevents runaway drift while easily tracking crystal drift (~0.05ms/s).
+        if delta > 10 && now.duration_since(self.last_slew_instant) >= Duration::from_millis(500) {
+            self.base_remote_pts = Some(base_remote.wrapping_add(1));
+            self.last_slew_instant = now;
+        }
         true
     }
 
@@ -522,5 +552,28 @@ mod tests {
 
         let (parsed, _) = VideoChunkHeader::parse(&buf).expect("parse video chunk failed");
         assert_eq!(parsed, vh);
+    }
+
+    #[test]
+    fn test_pts_clock_normal_and_drift() {
+        let mut clock = PtsClock::new(25);
+        // First packet initializes baseline
+        assert!(clock.is_packet_acceptable(1000));
+        assert_eq!(clock.jitter_ms(1000), Some(0));
+
+        // Packets on time
+        assert!(clock.is_packet_acceptable(1010));
+
+        // Isolated late packet should be dropped
+        assert!(!clock.is_packet_acceptable(950));
+
+        // 5 consecutive late packets triggers resync
+        assert!(!clock.is_packet_acceptable(950));
+        assert!(!clock.is_packet_acceptable(950));
+        assert!(!clock.is_packet_acceptable(950));
+        assert!(clock.is_packet_acceptable(950)); // 5th consecutive packet resyncs
+
+        // Large jump immediately resyncs
+        assert!(clock.is_packet_acceptable(50000));
     }
 }

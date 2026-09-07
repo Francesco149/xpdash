@@ -197,7 +197,7 @@ async fn run_media_loop<P: Producer<Item = f32>>(
     log::info!("Media stream receiver listening on UDP port {} (8MB buffer).", UDP_MEDIA_PORT);
 
     let mut buf = [0u8; 2048];
-    let mut audio_clock = PtsClock::new(15);
+    let mut audio_clock = PtsClock::new(25);
     let mut video_frames: HashMap<u32, PartialVideoFrame> = HashMap::new();
     let mut last_stats = Instant::now();
     let mut audio_packets_rx: u64 = 0;
@@ -207,6 +207,10 @@ async fn run_media_loop<P: Producer<Item = f32>>(
     let mut total_jitter_abs: f64 = 0.0;
     let mut jitter_samples: u64 = 0;
     let mut bytes_in_window: u64 = 0;
+    let mut record_file = std::env::var("XPDASH_RECORD_AUDIO").ok().and_then(|p| {
+        log::info!("Recording raw audio stream to: {}", p);
+        std::fs::File::create(p).ok()
+    });
     loop {
         let (len, _src) = socket.recv_from(&mut buf).await?;
         if len < NetPacketHeader::SIZE {
@@ -237,6 +241,10 @@ async fn run_media_loop<P: Producer<Item = f32>>(
                             let sample_f32 = (sample_i16 as f32) / 32768.0;
                             let _ = audio_prod.try_push(sample_f32);
                             i += 2;
+                        }
+                        if let Some(ref mut f) = record_file {
+                            use std::io::Write;
+                            let _ = f.write_all(pcm_data);
                         }
                     }
                 }

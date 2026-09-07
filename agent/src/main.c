@@ -3,6 +3,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <stdlib.h>
+#include <mmsystem.h>
 
 #include "audio.h"
 #include "video.h"
@@ -103,7 +104,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     agent_log("All subsystems initialized, entering main loop");
 
     MSG msg;
-    DWORD last_video_tick = GetTickCount();
+    DWORD last_video_tick = timeGetTime();
 
     while (g_running) {
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -118,12 +119,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         discover_poll();
         net_poll_control(on_stream_state, NULL);
 
-        DWORD now = GetTickCount();
-        if (now - last_video_tick >= 16) { // ~60 fps
-            video_capture();
-            last_video_tick = now;
+        DWORD now = timeGetTime();
+        if (net_is_streaming_active()) {
+            if (now - last_video_tick >= 16) { // ~60 fps
+                video_capture();
+                last_video_tick = now;
+            } else {
+                Sleep(1);
+            }
         } else {
-            Sleep(1);
+            Sleep(10);
         }
     }
 

@@ -3,6 +3,7 @@
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <mmsystem.h>
 
 #define TILE_SIZE 64
 #define KEYFRAME_INTERVAL 60
@@ -116,43 +117,11 @@ int video_init(video_frame_cb callback, void *user_data) {
     return video_resize(w, h);
 }
 
-/* Fast tile comparison: check if any 64x64 tile has differences */
+/* Fast comparison: check if framebuffer has differences */
 static int is_screen_dirty(void) {
     if (!g_pixels || !g_prev_pixels) return 1;
-
-    int tiles_x = (g_width + TILE_SIZE - 1) / TILE_SIZE;
-    int tiles_y = (g_height + TILE_SIZE - 1) / TILE_SIZE;
-
-    const uint32_t *curr = (const uint32_t *)g_pixels;
-    const uint32_t *prev = (const uint32_t *)g_prev_pixels;
-
-    for (int ty = 0; ty < tiles_y; ty++) {
-        int y_start = ty * TILE_SIZE;
-        int y_end = y_start + TILE_SIZE;
-        if (y_end > g_height) y_end = g_height;
-
-        for (int tx = 0; tx < tiles_x; tx++) {
-            int x_start = tx * TILE_SIZE;
-            int x_end = x_start + TILE_SIZE;
-            if (x_end > g_width) x_end = g_width;
-
-            int sample_x = (x_start + x_end) / 2;
-            int sample_y = (y_start + y_end) / 2;
-            if (curr[sample_y * g_width + sample_x] != prev[sample_y * g_width + sample_x]) {
-                return 1;
-            }
-
-            for (int y = y_start; y < y_end; y += 4) {
-                int row_offset = y * g_width;
-                for (int x = x_start; x < x_end; x += 4) {
-                    if (curr[row_offset + x] != prev[row_offset + x]) {
-                        return 1;
-                    }
-                }
-            }
-        }
-    }
-    return 0;
+    int raw_size = g_width * g_height * 4;
+    return (memcmp(g_pixels, g_prev_pixels, raw_size) != 0);
 }
 
 int video_capture(void) {
@@ -175,7 +144,7 @@ int video_capture(void) {
         return 0;
     }
 
-    uint32_t now = GetTickCount();
+    uint32_t now = timeGetTime();
     g_frame_counter++;
 
     int is_keyframe = g_force_keyframe || ((g_frame_counter % KEYFRAME_INTERVAL) == 0);
