@@ -238,7 +238,6 @@ async fn run_headless_mode(args: Vec<String>) -> Result<(), Box<dyn std::error::
     audio_running.store(false, Ordering::SeqCst);
     Ok(())
 }
-
 fn init_audio_output<C: Consumer<Item = f32> + Send + 'static>(
     mut consumer: C,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
@@ -287,7 +286,7 @@ async fn run_media_loop<P: Producer<Item = f32>>(
     let socket = UdpSocket::from_std(std_sock)?;
 
     let mut buf = [0u8; 2048];
-    let mut audio_clock = PtsClock::new(25);
+    let mut audio_clock = PtsClock::new(100);
     let mut video_frames: HashMap<u32, PartialVideoFrame> = HashMap::new();
     let mut last_stats = Instant::now();
     let mut audio_packets_rx: u64 = 0;

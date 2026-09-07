@@ -101,11 +101,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     audio_init(on_audio_frame, NULL);
     audio_start();
     video_init(on_video_frame, NULL);
+    video_start();
     agent_log("All subsystems initialized, entering main loop");
 
     MSG msg;
-    DWORD last_video_tick = timeGetTime();
-
     while (g_running) {
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
@@ -119,17 +118,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         discover_poll();
         net_poll_control(on_stream_state, NULL);
 
-        DWORD now = timeGetTime();
-        if (net_is_streaming_active()) {
-            if (now - last_video_tick >= 16) { // ~60 fps
-                video_capture();
-                last_video_tick = now;
-            } else {
-                Sleep(1);
-            }
-        } else {
-            Sleep(10);
-        }
+        Sleep(1);
     }
 
     agent_log("Exiting main loop, shutting down subsystems");

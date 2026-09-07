@@ -1,10 +1,57 @@
+#include <winsock2.h>
 #include "video.h"
 #include "lz4.h"
 #include "log.h"
+#include "net.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <mmsystem.h>
+#include <ddraw.h>
 
+static HMODULE g_h_ddraw = NULL;
+static LPDIRECTDRAW g_pdd = NULL;
+
+static void vblank_init(void) {
+    if (g_pdd) return;
+    g_h_ddraw = LoadLibraryA("ddraw.dll");
+    if (!g_h_ddraw) return;
+
+    typedef HRESULT (WINAPI *DirectDrawCreate_fn)(GUID *lpGUID, LPDIRECTDRAW *lplpDD, IUnknown *pUnkOuter);
+    DirectDrawCreate_fn pfnDirectDrawCreate = (DirectDrawCreate_fn)GetProcAddress(g_h_ddraw, "DirectDrawCreate");
+    if (!pfnDirectDrawCreate) return;
+
+    LPDIRECTDRAW pdd = NULL;
+    if (pfnDirectDrawCreate(NULL, &pdd, NULL) == DD_OK && pdd) {
+        pdd->lpVtbl->SetCooperativeLevel(pdd, NULL, DDSCL_NORMAL);
+        g_pdd = pdd;
+        agent_log("video_init: DirectDraw hardware VSync synchronization initialized");
+    }
+}
+
+static void vblank_wait(void) {
+    if (g_pdd) {
+        g_pdd->lpVtbl->WaitForVerticalBlank(g_pdd, DDWAITVB_BLOCKBEGIN, NULL);
+    }
+}
+
+static void draw_cursor(HDC hdc) {
+    CURSORINFO ci;
+    memset(&ci, 0, sizeof(ci));
+    ci.cbSize = sizeof(CURSORINFO);
+    if (GetCursorInfo(&ci)) {
+        if (ci.flags & CURSOR_SHOWING) {
+            ICONINFO ii;
+            memset(&ii, 0, sizeof(ii));
+            if (GetIconInfo(ci.hCursor, &ii)) {
+                int x = ci.ptScreenPos.x - (int)ii.xHotspot;
+                int y = ci.ptScreenPos.y - (int)ii.yHotspot;
+                DrawIconEx(hdc, x, y, ci.hCursor, 0, 0, 0, NULL, DI_NORMAL);
+                if (ii.hbmMask) DeleteObject(ii.hbmMask);
+                if (ii.hbmColor) DeleteObject(ii.hbmColor);
+            }
+        }
+    }
+}
 #define TILE_SIZE 64
 #define KEYFRAME_INTERVAL 60
 
@@ -25,6 +72,53 @@ static int g_force_keyframe = 1;
 static video_frame_cb g_cb = NULL;
 static void *g_cb_userdata = NULL;
 
+static HANDLE g_h_video_thread = NULL;
+static volatile int g_video_running = 0;
+
+static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
+    (void)lpParam;
+    agent_log("video_worker_thread: capture thread started");
+    DWORD last_tick = timeGetTime();
+
+    while (g_video_running) {
+        if (net_is_streaming_active()) {
+            DWORD now = timeGetTime();
+            if (now - last_tick >= 16) {
+                video_capture();
+                last_tick = now;
+            } else {
+                Sleep(1);
+            }
+        } else {
+            Sleep(50);
+        }
+    }
+    agent_log("video_worker_thread: capture thread stopped");
+    return 0;
+}
+
+int video_start(void) {
+    if (g_h_video_thread != NULL) return 1;
+    g_video_running = 1;
+    g_h_video_thread = CreateThread(NULL, 0, video_worker_thread, NULL, 0, NULL);
+    if (!g_h_video_thread) {
+        agent_log("CreateThread for video_worker_thread failed! err=%lu", GetLastError());
+        g_video_running = 0;
+        return 0;
+    }
+    SetThreadPriority(g_h_video_thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    agent_log("video_start: worker thread launched");
+    return 1;
+}
+
+void video_stop(void) {
+    if (g_h_video_thread) {
+        g_video_running = 0;
+        WaitForSingleObject(g_h_video_thread, 2000);
+        CloseHandle(g_h_video_thread);
+        g_h_video_thread = NULL;
+    }
+}
 void video_force_keyframe(void) {
     g_force_keyframe = 1;
 }
@@ -106,6 +200,7 @@ int video_init(video_frame_cb callback, void *user_data) {
 
     g_hdc_mem = CreateCompatibleDC(g_hdc_screen);
     agent_log("video_init: CreateCompatibleDC = %p", g_hdc_mem);
+    vblank_init();
     if (!g_hdc_mem) {
         agent_log("CreateCompatibleDC failed! err=%lu", GetLastError());
         return 0;
@@ -134,6 +229,8 @@ int video_capture(void) {
         }
         return 0;
     }
+    // Synchronize with hardware VSync to prevent capturing mid-render Direct3D buffers
+    vblank_wait();
 
     if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
         static int s_logged_blt_fail = 0;
@@ -143,6 +240,9 @@ int video_capture(void) {
         }
         return 0;
     }
+
+    // Render current mouse cursor directly into framebuffer
+    draw_cursor(g_hdc_mem);
 
     uint32_t now = timeGetTime();
     g_frame_counter++;
@@ -179,6 +279,7 @@ int video_capture(void) {
 }
 
 void video_shutdown(void) {
+    video_stop();
     if (g_hdc_mem) {
         if (g_hbm && g_hbm_old) {
             SelectObject(g_hdc_mem, g_hbm_old);
@@ -203,5 +304,13 @@ void video_shutdown(void) {
     if (g_hdc_screen) {
         ReleaseDC(NULL, g_hdc_screen);
         g_hdc_screen = NULL;
+    }
+    if (g_pdd) {
+        g_pdd->lpVtbl->Release(g_pdd);
+        g_pdd = NULL;
+    }
+    if (g_h_ddraw) {
+        FreeLibrary(g_h_ddraw);
+        g_h_ddraw = NULL;
     }
 }

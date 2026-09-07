@@ -21,6 +21,12 @@ void video_force_keyframe(void);
 /* Handle resolution change event (e.g. from WM_DISPLAYCHANGE) */
 int video_resize(int new_width, int new_height);
 
+/* Start video capture background worker thread */
+int video_start(void);
+
+/* Stop video capture background worker thread */
+void video_stop(void);
+
 /* Cleanup video capture resources */
 void video_shutdown(void);
 

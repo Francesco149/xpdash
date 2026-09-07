@@ -59,8 +59,28 @@ impl InputHandler {
         _guest_height: u16,
         session: &ClientSession,
     ) {
-        let events = ctx.input(|i| i.events.clone());
+        // Enforce OS cursor lock mode
+        if self.is_confined() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
 
+            // Continuous relative hardware delta tracking (never clamped by window borders)
+            let delta = ctx.input(|i| i.pointer.delta());
+            if delta.x != 0.0 || delta.y != 0.0 {
+                session.send_input(MsgInputEvent {
+                    event_type: INPUT_TYPE_MOUSE_REL,
+                    param1: 0,
+                    param2: delta.x as i16,
+                    param3: delta.y as i16,
+                    key_down: 0,
+                });
+            }
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+        }
+
+        let events = ctx.input(|i| i.events.clone());
         for event in events {
             match event {
                 // Key press / release
@@ -98,38 +118,20 @@ impl InputHandler {
 
                 // Mouse motion
                 Event::PointerMoved(pos) => {
-                    if viewport_rect.contains(pos) {
-                        if self.is_confined() {
-                            if let Some(prev) = self.last_cursor_pos {
-                                let delta = pos - prev;
-                                let dx = delta.x as i16;
-                                let dy = delta.y as i16;
-                                if dx != 0 || dy != 0 {
-                                    session.send_input(MsgInputEvent {
-                                        event_type: INPUT_TYPE_MOUSE_REL,
-                                        param1: 0,
-                                        param2: dx,
-                                        param3: dy,
-                                        key_down: 0,
-                                    });
-                                }
-                            }
-                            self.last_cursor_pos = Some(pos);
-                        } else {
-                            // Map absolute coordinate to guest space (0..65535)
-                            let rel_x = (pos.x - viewport_rect.left()) / viewport_rect.width();
-                            let rel_y = (pos.y - viewport_rect.top()) / viewport_rect.height();
-                            let abs_x = (rel_x.clamp(0.0, 1.0) * 65535.0) as i16;
-                            let abs_y = (rel_y.clamp(0.0, 1.0) * 65535.0) as i16;
+                    if !self.is_confined() && viewport_rect.contains(pos) {
+                        // Map absolute coordinate to guest space (0..65535)
+                        let rel_x = (pos.x - viewport_rect.left()) / viewport_rect.width();
+                        let rel_y = (pos.y - viewport_rect.top()) / viewport_rect.height();
+                        let abs_x = (rel_x.clamp(0.0, 1.0) * 65535.0) as u16;
+                        let abs_y = (rel_y.clamp(0.0, 1.0) * 65535.0) as u16;
 
-                            session.send_input(MsgInputEvent {
-                                event_type: INPUT_TYPE_MOUSE_ABS,
-                                param1: 0,
-                                param2: abs_x,
-                                param3: abs_y,
-                                key_down: 0,
-                            });
-                        }
+                        session.send_input(MsgInputEvent {
+                            event_type: INPUT_TYPE_MOUSE_ABS,
+                            param1: 0,
+                            param2: abs_x as i16,
+                            param3: abs_y as i16,
+                            key_down: 0,
+                        });
                     }
                 }
 
@@ -270,6 +272,17 @@ pub fn key_to_ps2_scancode(key: Key) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cursor_grab_command() {
+        let _ = egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked);
+        let _ = egui::ViewportCommand::CursorGrab(egui::CursorGrab::None);
+        let _ = egui::ViewportCommand::CursorVisible(false);
+        let _ = egui::ViewportCommand::CursorVisible(true);
+        let ctx = egui::Context::default();
+        let delta = ctx.input(|i| i.pointer.delta());
+        assert_eq!(delta, egui::Vec2::ZERO);
+    }
 
     #[test]
     fn test_ps2_scancode_mapping() {

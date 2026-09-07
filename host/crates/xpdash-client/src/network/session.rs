@@ -278,7 +278,7 @@ async fn run_media_receiver(
     let socket = UdpSocket::from_std(std_sock)?;
     log::info!("Media receiver listening on UDP port {} (8MB buffer).", UDP_MEDIA_PORT);
 
-    let mut audio_clock = PtsClock::new(25);
+    let mut audio_clock = PtsClock::new(100);
     let mut video_frames: HashMap<u32, PartialVideoFrame> = HashMap::new();
 
     let mut buf = [0u8; 2048];
@@ -374,8 +374,9 @@ async fn run_media_receiver(
             }
         }
 
-        if video_frames.len() > 100 {
-            video_frames.clear();
+        if video_frames.len() > 16 {
+            let max_idx = video_frames.keys().copied().max().unwrap_or(0);
+            video_frames.retain(|&idx, _| idx + 8 >= max_idx);
         }
 
         if last_stats.elapsed() >= Duration::from_millis(500) {

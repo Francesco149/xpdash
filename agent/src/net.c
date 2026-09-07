@@ -4,12 +4,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define CHUNK_DATA_MAX 1200
+#define CHUNK_DATA_MAX 1370
 #define TCP_RECV_BUF_SIZE 4096
 
 static SOCKET g_sock_tcp = INVALID_SOCKET;
 static SOCKET g_client_tcp = INVALID_SOCKET;
 static SOCKET g_sock_udp = INVALID_SOCKET;
+static CRITICAL_SECTION g_cs_udp;
 static struct sockaddr_in g_media_dest;
 static int g_has_media_dest = 0;
 static int g_is_streaming = 0;
@@ -73,11 +74,10 @@ int net_init(void) {
         return 0;
     }
 
+    InitializeCriticalSection(&g_cs_udp);
     int sndbuf = 2 * 1024 * 1024;
     setsockopt(g_sock_udp, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof(sndbuf));
 
-    u_long mode = 1;
-    ioctlsocket(g_sock_udp, FIONBIO, &mode);
     agent_log("net_init: Winsock and UDP socket ready");
     return 1;
 }
@@ -198,11 +198,17 @@ int net_send_audio(const uint8_t *pcm_data, uint32_t size, uint32_t pts_ms) {
 
         memcpy(packet + sizeof(NetPacketHeader) + sizeof(AudioSliceHeader), pcm_data + offset, this_slice);
 
+        EnterCriticalSection(&g_cs_udp);
         int sent = sendto(g_sock_udp, (const char *)packet,
                           sizeof(NetPacketHeader) + sizeof(AudioSliceHeader) + this_slice,
                           0, (struct sockaddr *)&g_media_dest, sizeof(g_media_dest));
-        if (sent <= 0) return 0;
-
+        if (sent <= 0) {
+            Sleep(0);
+            sendto(g_sock_udp, (const char *)packet,
+                   sizeof(NetPacketHeader) + sizeof(AudioSliceHeader) + this_slice,
+                   0, (struct sockaddr *)&g_media_dest, sizeof(g_media_dest));
+        }
+        LeaveCriticalSection(&g_cs_udp);
         offset += this_slice;
     }
     return 1;
@@ -251,11 +257,23 @@ int net_send_video_frame(const uint8_t *comp_data, uint32_t comp_size,
             memcpy(packet + sizeof(NetPacketHeader) + sizeof(VideoChunkHeader), comp_data + offset, this_chunk);
         }
 
-        sendto(g_sock_udp, (const char *)packet,
-               sizeof(NetPacketHeader) + sizeof(VideoChunkHeader) + this_chunk,
-               0, (struct sockaddr *)&g_media_dest, sizeof(g_media_dest));
-
+        EnterCriticalSection(&g_cs_udp);
+        int sent = sendto(g_sock_udp, (const char *)packet,
+                          sizeof(NetPacketHeader) + sizeof(VideoChunkHeader) + this_chunk,
+                          0, (struct sockaddr *)&g_media_dest, sizeof(g_media_dest));
+        if (sent <= 0) {
+            Sleep(0);
+            sendto(g_sock_udp, (const char *)packet,
+                   sizeof(NetPacketHeader) + sizeof(VideoChunkHeader) + this_chunk,
+                   0, (struct sockaddr *)&g_media_dest, sizeof(g_media_dest));
+        }
+        LeaveCriticalSection(&g_cs_udp);
         offset += this_chunk;
+
+        // Micro-pace every 16 chunks to avoid overflowing the 1 Gbps NIC FIFO queue
+        if ((c & 15) == 15) {
+            Sleep(0);
+        }
 
     }
     return 1;
@@ -406,5 +424,6 @@ void net_shutdown(void) {
         closesocket(g_sock_udp);
         g_sock_udp = INVALID_SOCKET;
     }
+    DeleteCriticalSection(&g_cs_udp);
     WSACleanup();
 }

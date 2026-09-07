@@ -22,15 +22,11 @@ void input_inject_mouse_rel(int16_t dx, int16_t dy) {
 }
 
 void input_inject_mouse_abs(uint16_t x, uint16_t y) {
-    int screen_w = GetSystemMetrics(SM_CXSCREEN);
-    int screen_h = GetSystemMetrics(SM_CYSCREEN);
-    if (screen_w <= 0 || screen_h <= 0) return;
-
     INPUT inp;
     memset(&inp, 0, sizeof(inp));
     inp.type = INPUT_MOUSE;
-    inp.mi.dx = (LONG)((x * 65535) / screen_w);
-    inp.mi.dy = (LONG)((y * 65535) / screen_h);
+    inp.mi.dx = (LONG)x;
+    inp.mi.dy = (LONG)y;
     inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
     SendInput(1, &inp, sizeof(INPUT));
 }
