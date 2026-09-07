@@ -305,18 +305,31 @@ async fn run_media_receiver(
                 // JPEG decode (TurboJPEG from agent)
                 let cursor = Cursor::new(&item.compressed_data[..]);
                 let mut decoder = JpegDecoder::new(cursor);
-                if let Ok(pixels) = decoder.decode() {
-                    // zune-jpeg decodes to RGB by default; convert to RGBA
-                    let pixel_count = (item.width as usize) * (item.height as usize);
-                    if pixels.len() >= pixel_count * 3 {
-                        let mut out = Vec::with_capacity(pixel_count * 4);
-                        for chunk in pixels.chunks_exact(3) {
-                            out.push(chunk[0]); // R
-                            out.push(chunk[1]); // G
-                            out.push(chunk[2]); // B
-                            out.push(255);      // A
+                match decoder.decode() {
+                    Ok(pixels) => {
+                        // zune-jpeg decodes to RGB by default; convert to RGBA
+                        let pixel_count = (item.width as usize) * (item.height as usize);
+                        if pixels.len() >= pixel_count * 3 {
+                            let mut out = Vec::with_capacity(pixel_count * 4);
+                            for chunk in pixels.chunks_exact(3) {
+                                out.push(chunk[0]); // R
+                                out.push(chunk[1]); // G
+                                out.push(chunk[2]); // B
+                                out.push(255);      // A
+                            }
+                            rgba = Some(out);
+                        } else {
+                            log::warn!("JPEG decode size mismatch: got {} bytes, expected {} ({}x{})",
+                                pixels.len(), pixel_count * 3, item.width, item.height);
                         }
-                        rgba = Some(out);
+                    }
+                    Err(e) => {
+                        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            log::error!("JPEG decode failed: {:?} (data_len={}, {}x{}, first_bytes={:02x?})",
+                                e, item.compressed_data.len(), item.width, item.height,
+                                &item.compressed_data[..item.compressed_data.len().min(16)]);
+                        }
                     }
                 }
             } else if item.codec == 2 {
