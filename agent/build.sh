@@ -15,6 +15,16 @@ fi
 
 mkdir -p bin
 
+# ─── 0. Check libjpeg-turbo prerequisite ─────────────────────────────────
+if [ ! -f lib/libturbojpeg.a ]; then
+    echo "[-] lib/libturbojpeg.a not found."
+    echo "    Cross-compile libjpeg-turbo 2.0.6 for i686-mingw32:"
+    echo "      cmake -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_C_COMPILER=i686-w64-mingw32-gcc \\"
+    echo "        -DWITH_SIMD=FALSE -DENABLE_SHARED=FALSE .."
+    echo "    Then: cp libturbojpeg.a agent/lib/"
+    exit 1
+fi
+
 # ─── 1. Build xpdash-hook.dll (D3D9 Present hook, injected into games) ───
 echo "[*] Compiling xpdash-hook.dll with $CC..."
 "$CC" -O2 -s -shared -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type \
