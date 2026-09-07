@@ -23,7 +23,7 @@ static HANDLE  g_ack_event    = NULL;
 static uint32_t g_last_seq    = 0;
 static HANDLE  g_injected_proc = NULL;
 static DWORD   g_injected_pid  = 0;
-
+static HMODULE g_remote_dll_base = NULL;
 /* ─── Init / Shutdown ─────────────────────────────────────────────────── */
 
 int d3d9hook_init(void) {
@@ -34,7 +34,7 @@ int d3d9hook_init(void) {
     g_last_seq     = 0;
     g_injected_proc = NULL;
     g_injected_pid  = 0;
-    agent_log("d3d9hook_init: ready");
+    g_remote_dll_base = NULL;
     return 1;
 }
 
@@ -78,9 +78,9 @@ void d3d9hook_shutdown(void) {
     if (g_injected_proc) {
         CloseHandle(g_injected_proc);
         g_injected_proc = NULL;
+        g_injected_pid  = 0;
+        g_remote_dll_base = NULL;
     }
-    g_injected_pid = 0;
-    agent_log("d3d9hook_shutdown: cleaned up");
 }
 
 /* ─── Process Detection ───────────────────────────────────────────────── */
@@ -149,7 +149,8 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
         close_shm();
         CloseHandle(g_injected_proc);
         g_injected_proc = NULL;
-        g_injected_pid = 0;
+        g_injected_pid  = 0;
+        g_remote_dll_base = NULL;
     }
 
     /* Auto-detect if no PID given */
@@ -232,7 +233,7 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
 
     g_injected_proc = hProc;
     g_injected_pid = target_pid;
-
+    g_remote_dll_base = (HMODULE)exit_code;
     /* Try to open shared memory — the hook DLL creates SHM in DllMain
        immediately, but the hook installation is deferred to a background
        thread (500ms delay for loader lock + device creation). Retry a
@@ -252,6 +253,29 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
     return 1;
 }
 
+static void d3d9hook_try_rehook(void) {
+    if (!g_injected_proc || !g_remote_dll_base) return;
+
+    HMODULE hLocal = LoadLibraryA("C:\\xpdash\\xpdash-hook9.dll");
+    if (!hLocal) hLocal = LoadLibraryA("C:\\xpdash\\xpdash-hook.dll");
+    if (!hLocal) return;
+
+    FARPROC pFn = GetProcAddress(hLocal, "install_d3d9_hooks");
+    if (pFn) {
+        uintptr_t offset = (uintptr_t)pFn - (uintptr_t)hLocal;
+        LPTHREAD_START_ROUTINE pRemote = (LPTHREAD_START_ROUTINE)((uintptr_t)g_remote_dll_base + offset);
+        HANDLE hThread = CreateRemoteThread(g_injected_proc, NULL, 0, pRemote, NULL, 0, NULL);
+        if (hThread) {
+            WaitForSingleObject(hThread, 1500);
+            DWORD code = 0;
+            GetExitCodeThread(hThread, &code);
+            CloseHandle(hThread);
+            agent_log("d3d9hook: remote install_d3d9_hooks returned %lu", (unsigned long)code);
+        }
+    }
+    FreeLibrary(hLocal);
+}
+
 /* ─── Frame Reading ───────────────────────────────────────────────────── */
 
 int d3d9hook_is_active(void) {
@@ -265,6 +289,7 @@ int d3d9hook_is_active(void) {
             CloseHandle(g_injected_proc);
             g_injected_proc = NULL;
             g_injected_pid = 0;
+            g_remote_dll_base = NULL;
             return 0;
         }
     }
@@ -276,7 +301,15 @@ int d3d9hook_is_active(void) {
 
     HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
     if (hdr->magic != 0x48443344) return 0;
-    if (!hdr->hook_active) return 0;
+    if (!hdr->hook_active) {
+        static DWORD s_last_rehook_try = 0;
+        DWORD now = timeGetTime();
+        if (g_injected_proc && now - s_last_rehook_try >= 1500) {
+            s_last_rehook_try = now;
+            d3d9hook_try_rehook();
+        }
+        return 0;
+    }
 
     return 1;
 }

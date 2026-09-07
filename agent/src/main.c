@@ -39,7 +39,7 @@ static void on_stream_state(int is_streaming, void *user_data) {
            If a D3D9 game is running, this hooks Present() for
            flicker-free capture. If no game is running, this is a no-op. */
         if (!d3d9hook_is_active()) {
-            d3d9hook_inject("C:\\xpdash\\xpdash-hook.dll", 0);
+            d3d9hook_inject("C:\\xpdash\\xpdash-hook9.dll", 0);
         }
     }
 }
@@ -134,7 +134,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             DWORD now = timeGetTime();
             if (now - s_last_hook_poll >= 1500) {
                 s_last_hook_poll = now;
-                d3d9hook_inject("C:\\xpdash\\xpdash-hook.dll", 0);
+                d3d9hook_inject("C:\\xpdash\\xpdash-hook9.dll", 0);
             }
         }
 

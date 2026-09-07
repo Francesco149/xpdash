@@ -503,25 +503,40 @@ static void remove_hooks(void) {
 
 static HANDLE g_init_thread = NULL;
 
-static DWORD WINAPI hook_init_thread(LPVOID param) {
-    (void)param;
-
-    /* Brief delay to let the loader lock release and the game's D3D9
-       device initialization complete. Some games create their device in
-       early startup — we need the real device's vtable to be established. */
-    Sleep(500);
-
-    if (!install_hooks()) {
-        /* Hook installation failed — clean up shared memory.
-           This is not fatal — the agent will fall back to BitBlt. */
+__declspec(dllexport) int install_d3d9_hooks(void) {
+    if (g_initialized && g_hooked_vtable) return 1;
+    if (install_hooks()) {
         HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
-        if (hdr) hdr->hook_active = 0;
+        if (hdr) hdr->hook_active = 1;
+        g_initialized = 1;
         return 1;
     }
-    g_initialized = 1;
     return 0;
 }
 
+static DWORD WINAPI hook_init_thread(LPVOID param) {
+    (void)param;
+
+    hook_log("hook_init_thread: background init loop started");
+
+    /* Retry install_hooks() periodically until the game initializes its D3D9 device.
+       Games take between 1 to 15 seconds to create their device after launch. */
+    for (int retry = 0; retry < 150; retry++) {
+        Sleep(200);
+        if (install_hooks()) {
+            HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+            if (hdr) hdr->hook_active = 1;
+            g_initialized = 1;
+            hook_log("hook_init_thread: successfully hooked after %dms", (retry + 1) * 200);
+            return 0;
+        }
+    }
+
+    hook_log("hook_init_thread: gave up after 30s, hook inactive");
+    HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+    if (hdr) hdr->hook_active = 0;
+    return 1;
+}
 BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpReserved) {
     (void)lpReserved;
 

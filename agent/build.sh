@@ -27,7 +27,7 @@ fi
 
 # ─── 1. Build xpdash-hook.dll (D3D9 Present hook, injected into games) ───
 echo "[*] Compiling xpdash-hook.dll with $CC..."
-"$CC" -O2 -s -shared -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type \
+"$CC" -O2 -shared -Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type \
     -D_WIN32_WINNT=0x0501 -Isrc \
     -static-libgcc \
     src/d3d9hook_dll.c \
@@ -45,6 +45,7 @@ else
     echo "[+] xpdash-hook.dll imports verified: XP compatible."
 fi
 
+cp bin/xpdash-hook.dll bin/xpdash-hook9.dll
 echo "[+] Successfully built bin/xpdash-hook.dll ($(stat -c%s bin/xpdash-hook.dll) bytes)"
 
 # ─── 2. Build xpdash-agent.exe (main agent) ─────────────────────────────
