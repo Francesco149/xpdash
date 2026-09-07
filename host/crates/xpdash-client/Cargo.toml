@@ -17,4 +17,4 @@ socket2.workspace = true
 egui.workspace = true
 eframe.workspace = true
 parking_lot = "0.12"
-bytemuck = "1.25"
+bytemuck = { version = "1.25", features = ["extern_crate_alloc"] }

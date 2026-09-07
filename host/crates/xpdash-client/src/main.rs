@@ -285,7 +285,7 @@ async fn run_media_loop<P: Producer<Item = f32>>(
     std_sock.set_nonblocking(true)?;
     let socket = UdpSocket::from_std(std_sock)?;
 
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; 16384];
     let mut audio_clock = PtsClock::new(100);
     let mut video_frames: HashMap<u32, PartialVideoFrame> = HashMap::new();
     let mut last_stats = Instant::now();

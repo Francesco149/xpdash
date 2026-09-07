@@ -146,7 +146,8 @@ async fn run_session(
         }
     }
     let mut tcp_stream = tcp_stream.ok_or("Failed to connect to agent after retries")?;
-    log::info!("Connected to agent control port {}.", agent_addr);
+    tcp_stream.set_nodelay(true)?;
+    log::info!("Connected to agent control port {} (TCP_NODELAY enabled).", agent_addr);
 
     // Request stream start
     let start_msg = [OP_STREAM_START, 0, 0, 0];
@@ -286,7 +287,7 @@ async fn run_media_receiver(
         compressed_data: Vec<u8>,
     }
 
-    let (decompress_tx, mut decompress_rx) = tokio::sync::mpsc::channel::<CompressedFrame>(8);
+    let (decompress_tx, mut decompress_rx) = tokio::sync::mpsc::channel::<CompressedFrame>(2);
     let frame_sink = latest_frame.clone();
     let metrics_worker = metrics.clone();
 
@@ -295,11 +296,9 @@ async fn run_media_receiver(
             if item.codec == 2 {
                 let uncompressed_len = (item.width as usize) * (item.height as usize) * 4;
                 if let Ok(mut rgba) = lz4_flex::decompress(&item.compressed_data, uncompressed_len) {
+                    // BGRA → RGBA byte swap (auto-vectorizes with -C target-cpu=native)
                     for chunk in rgba.chunks_exact_mut(4) {
-                        let b = chunk[0];
-                        let r = chunk[2];
-                        chunk[0] = r;
-                        chunk[2] = b;
+                        chunk.swap(0, 2);
                         chunk[3] = 255;
                     }
 
@@ -317,7 +316,7 @@ async fn run_media_receiver(
         }
     });
 
-    let mut audio_clock = PtsClock::new(100);
+    let mut audio_clock = PtsClock::new(30);
     let mut video_frames: HashMap<u32, PartialVideoFrame> = HashMap::new();
     let mut last_stats = Instant::now();
     let mut bytes_in_window: u64 = 0;
@@ -325,7 +324,7 @@ async fn run_media_receiver(
     let mut total_jitter_abs: f64 = 0.0;
     let mut jitter_samples: u64 = 0;
 
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; 16384];
     while running.load(Ordering::Relaxed) {
         let (len, _src) = match socket.recv_from(&mut buf).await {
             Ok(res) => res,

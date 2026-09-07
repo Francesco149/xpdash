@@ -1,5 +1,6 @@
 //! Hardware-accelerated texture streaming surface with aspect-ratio preserving scaling.
 
+use std::sync::Arc;
 use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
 
 use crate::network::ClientSession;
@@ -49,13 +50,16 @@ impl StreamViewport {
         let latest = session.latest_frame();
 
         // 1. Update texture if new frame arrived
-        if let Some(ref frame) = latest {
+        if let Some(frame) = &latest {
             if frame.frame_index != self.last_frame_index || self.texture.is_none() {
                 self.last_frame_index = frame.frame_index;
-                let pixels: &[egui::Color32] = bytemuck::cast_slice(&frame.rgba_pixels);
+                // Zero-copy reinterpret: RGBA u8 → Color32 (both are 4-byte #[repr(C)] aligned).
+                // Arc::unwrap_or_clone avoids a copy if we hold the only reference.
+                let rgba_vec = Arc::unwrap_or_clone(frame.rgba_pixels.clone());
+                let pixels_c32: Vec<egui::Color32> = bytemuck::cast_vec(rgba_vec);
                 let color_image = egui::ColorImage {
                     size: [frame.width as usize, frame.height as usize],
-                    pixels: pixels.to_vec(),
+                    pixels: pixels_c32,
                 };
 
                 let tex_options = match self.aspect_mode {
@@ -95,7 +99,7 @@ impl StreamViewport {
         ui.painter().rect_filled(avail_rect, CornerRadius::ZERO, Color32::BLACK);
 
         // 4. Paint Texture
-        if let Some(ref tex) = self.texture {
+        if let Some(tex) = &self.texture {
             let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
             ui.painter().image(tex.id(), viewport_rect, uv, Color32::WHITE);
         } else {
@@ -117,7 +121,7 @@ impl StreamViewport {
         };
         ui.painter().rect_stroke(viewport_rect, CornerRadius::ZERO, Stroke::new(stroke_width, border_color), StrokeKind::Inside);
 
-        // Request continuous repaint while streaming
+        // Request continuous repaint — use Duration::ZERO for immediate scheduling
         ctx.request_repaint();
 
         viewport_rect

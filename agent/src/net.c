@@ -1,10 +1,15 @@
 #include "net.h"
+#include <ws2tcpip.h>
 #include "input.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 
-#define CHUNK_DATA_MAX 1370
+/* Use large UDP datagrams (8KB) to reduce per-frame sendto() syscall count.
+   IP fragmentation handles link-layer splitting; reassembly is transparent
+   to the receiver on a reliable LAN. 800x600 LZ4 ~1.3MB / 8000 = ~163 packets
+   vs 971 packets at 1370 bytes. */
+#define CHUNK_DATA_MAX 8000
 #define TCP_RECV_BUF_SIZE 4096
 
 static SOCKET g_sock_tcp = INVALID_SOCKET;
@@ -152,6 +157,10 @@ int net_connect_to_server(const char *ip, uint16_t control_port, uint16_t media_
 
     u_long mode = 1;
     ioctlsocket(s, FIONBIO, &mode);
+    /* Disable Nagle — input events (mouse moves at ~125Hz) must not be
+       coalesced into 40ms bursts by the TCP stack. */
+    int nodelay = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
 
     g_client_tcp = s;
     net_set_media_destination(ip, media_port);
@@ -229,7 +238,7 @@ int net_send_video_frame(const uint8_t *comp_data, uint32_t comp_size,
         s_logged_video_send = 1;
     }
 
-    uint8_t packet[1500];
+    uint8_t packet[sizeof(NetPacketHeader) + sizeof(VideoChunkHeader) + CHUNK_DATA_MAX];
     uint32_t offset = 0;
 
     for (uint16_t c = 0; c < total_chunks; c++) {
@@ -365,6 +374,9 @@ void net_poll_control(net_stream_state_cb on_state_change, void *user_data) {
             g_client_tcp = s;
             u_long mode = 1;
             ioctlsocket(g_client_tcp, FIONBIO, &mode);
+            /* Disable Nagle for immediate input delivery */
+            int nodelay = 1;
+            setsockopt(g_client_tcp, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
             char *ip = inet_ntoa(client_addr.sin_addr);
             agent_log("Control: Client connected from %s", ip);
 

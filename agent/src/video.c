@@ -64,13 +64,20 @@ static void draw_cursor(HDC hdc) {
                       ci.flags, ci.hCursor, ci.ptScreenPos.x, ci.ptScreenPos.y);
             s_logged_cursor = 1;
         }
-        if (ci.flags & CURSOR_SHOWING) {
+        /* Always composite cursor — DirectX fullscreen games hide the system
+           cursor (CURSOR_SHOWING=0) but GetCursorInfo still reports position.
+           Without this, the cursor is invisible in games like GTA SA. */
+        HCURSOR hCur = ci.hCursor;
+        if (!hCur) {
+            hCur = LoadCursor(NULL, IDC_ARROW);
+        }
+        if (hCur) {
             ICONINFO ii;
             memset(&ii, 0, sizeof(ii));
-            if (GetIconInfo(ci.hCursor, &ii)) {
+            if (GetIconInfo(hCur, &ii)) {
                 int x = ci.ptScreenPos.x - (int)ii.xHotspot;
                 int y = ci.ptScreenPos.y - (int)ii.yHotspot;
-                DrawIconEx(hdc, x, y, ci.hCursor, 0, 0, 0, NULL, DI_NORMAL);
+                DrawIconEx(hdc, x, y, hCur, 0, 0, 0, NULL, DI_NORMAL);
                 if (ii.hbmMask) DeleteObject(ii.hbmMask);
                 if (ii.hbmColor) DeleteObject(ii.hbmColor);
             }
@@ -109,14 +116,20 @@ static volatile int g_video_running = 0;
 static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
     (void)lpParam;
     agent_log("video_worker_thread: capture thread started");
-    DWORD last_tick = timeGetTime();
+    DWORD next_tick = timeGetTime();
 
     while (g_video_running) {
         if (net_is_streaming_active()) {
             DWORD now = timeGetTime();
-            if (now - last_tick >= 16) {
+            if ((int)(now - next_tick) >= 0) {
                 video_capture();
-                last_tick = now;
+                /* Schedule next capture 16ms from target, not from now,
+                   to avoid timing drift accumulation. */
+                next_tick += 16;
+                /* If we fell behind by more than 2 frames, reset to avoid burst. */
+                if ((int)(now - next_tick) > 32) {
+                    next_tick = now + 16;
+                }
             } else {
                 Sleep(1);
             }
@@ -260,10 +273,10 @@ int video_capture(void) {
         }
         return 0;
     }
-    // Synchronize with hardware VSync to prevent capturing mid-render Direct3D buffers
-    vblank_wait();
 
-    if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
+    DWORD t0 = timeGetTime();
+
+    if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY | CAPTUREBLT)) {
         static int s_logged_blt_fail = 0;
         if (!s_logged_blt_fail) {
             agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
@@ -272,8 +285,7 @@ int video_capture(void) {
         return 0;
     }
 
-    // Render current mouse cursor directly into framebuffer
-    draw_cursor(g_hdc_mem);
+    DWORD t1 = timeGetTime();
 
     uint32_t now = timeGetTime();
     g_frame_counter++;
@@ -282,12 +294,21 @@ int video_capture(void) {
     int dirty = is_keyframe ? 1 : is_screen_dirty();
 
     if (!dirty) {
-        return 1; // Nothing changed
+        return 1;
     }
+
+    /* Draw cursor AFTER dirty check — compositing the cursor into the
+       framebuffer before comparison would make every frame "dirty" even
+       when nothing on screen changed, forcing full LZ4 compression. */
+    draw_cursor(g_hdc_mem);
+
+    DWORD t2 = timeGetTime();
 
     int raw_size = g_width * g_height * 4;
     int comp_size = LZ4_compress_fast((const char *)g_pixels, (char *)g_comp_buf,
-                                      raw_size, g_comp_buf_cap, 1);
+                                      raw_size, g_comp_buf_cap, 10);
+
+    DWORD t3 = timeGetTime();
 
     static int s_logged_first_frame = 0;
     if (!s_logged_first_frame) {
@@ -302,8 +323,20 @@ int video_capture(void) {
         g_cb(g_comp_buf, (uint32_t)comp_size, g_frame_counter,
              (uint16_t)g_width, (uint16_t)g_height, codec, flags, now, g_cb_userdata);
 
+        DWORD t4 = timeGetTime();
+
         memcpy(g_prev_pixels, g_pixels, raw_size);
         g_force_keyframe = 0;
+
+        /* Log frame timing every 120 frames (~2s at 60fps) */
+        static uint32_t s_timing_accum = 0;
+        s_timing_accum++;
+        if (s_timing_accum >= 120) {
+            agent_log("frame_timing: blt=%lums comp=%lums send=%lums total=%lums comp_sz=%d",
+                      (unsigned long)(t1 - t0), (unsigned long)(t3 - t2),
+                      (unsigned long)(t4 - t3), (unsigned long)(t4 - t0), comp_size);
+            s_timing_accum = 0;
+        }
     }
 
     return 1;

@@ -19,9 +19,9 @@ pub struct AudioController {
 
 impl AudioController {
     pub fn new() -> Self {
-        // 48 kHz stereo 16-bit = 96,000 samples/sec.
-        // 50ms buffer capacity = 4,800 samples
-        let rb = HeapRb::<f32>::new(4800);
+        // 48 kHz stereo = 96,000 f32 samples/sec.
+        // 200ms buffer capacity = 19,200 samples — absorbs network burst without overflow.
+        let rb = HeapRb::<f32>::new(19200);
         let (producer, consumer) = rb.split();
 
         let volume_bits = Arc::new(AtomicU32::new(1.0f32.to_bits()));
@@ -98,14 +98,28 @@ fn init_cpal_stream<C: Consumer<Item = f32> + Send + 'static>(
         buffer_size: cpal::BufferSize::Fixed(480), // 10ms buffer size
     };
 
+    let mut last_sample: f32 = 0.0;
+    let mut underrun_count: u32 = 0;
     let stream = device.build_output_stream(
         &config,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             let is_muted = muted.load(Ordering::Relaxed);
             let vol = f32::from_bits(volume_bits.load(Ordering::Relaxed));
             for sample in data.iter_mut() {
-                let s = consumer.try_pop().unwrap_or(0.0);
-                *sample = if is_muted { 0.0 } else { s * vol };
+                if let Some(s) = consumer.try_pop() {
+                    last_sample = s;
+                    underrun_count = 0;
+                } else {
+                    // Sample-hold with fade-to-zero: repeat last sample for 1ms (48 samples),
+                    // then fade to zero over 1ms to avoid click artifacts.
+                    underrun_count += 1;
+                    if underrun_count > 96 {
+                        last_sample = 0.0;
+                    } else if underrun_count > 48 {
+                        last_sample *= 0.95;
+                    }
+                }
+                *sample = if is_muted { 0.0 } else { last_sample * vol };
             }
         },
         move |err| {
