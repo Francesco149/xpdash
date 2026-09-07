@@ -22,6 +22,15 @@ void input_inject_mouse_rel(int16_t dx, int16_t dy) {
 }
 
 void input_inject_mouse_abs(uint16_t x, uint16_t y) {
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    if (sw > 0 && sh > 0) {
+        int px = (int)(((uint32_t)x * (uint32_t)sw + 32768) / 65535);
+        int py = (int)(((uint32_t)y * (uint32_t)sh + 32768) / 65535);
+        if (px >= sw) px = sw - 1;
+        if (py >= sh) py = sh - 1;
+        SetCursorPos(px, py);
+    }
     INPUT inp;
     memset(&inp, 0, sizeof(inp));
     inp.type = INPUT_MOUSE;

@@ -127,6 +127,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         net_poll_control(on_stream_state, NULL);
         net_poll_udp_input();
 
+        /* Periodically attempt hook injection if streaming is active but hook is not */
+        if (net_is_streaming_active() && !d3d9hook_is_active()) {
+            static DWORD s_last_hook_poll = 0;
+            DWORD now = timeGetTime();
+            if (now - s_last_hook_poll >= 1500) {
+                s_last_hook_poll = now;
+                d3d9hook_inject("C:\\xpdash\\xpdash-hook.dll", 0);
+            }
+        }
+
         Sleep(1);
     }
 

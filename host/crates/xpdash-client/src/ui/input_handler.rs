@@ -62,7 +62,7 @@ impl InputHandler {
         // Enforce OS cursor lock mode
         if self.is_confined() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
 
             // Continuous relative hardware delta tracking (never clamped by window borders)
             let delta = ctx.input(|i| i.pointer.delta());
@@ -78,6 +78,28 @@ impl InputHandler {
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+
+            // Sample latest cursor position every frame to keep guest cursor
+            // exactly aligned with client mouse, even when window is resized.
+            if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                if viewport_rect.contains(pos) {
+                    let rel_x = (pos.x - viewport_rect.left()) / viewport_rect.width();
+                    let rel_y = (pos.y - viewport_rect.top()) / viewport_rect.height();
+                    let abs_x = (rel_x.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                    let abs_y = (rel_y.clamp(0.0, 1.0) * 65535.0).round() as u16;
+
+                    if self.last_cursor_pos != Some(pos) {
+                        self.last_cursor_pos = Some(pos);
+                        session.send_input(MsgInputEvent {
+                            event_type: INPUT_TYPE_MOUSE_ABS,
+                            param1: 0,
+                            param2: abs_x as i16,
+                            param3: abs_y as i16,
+                            key_down: 0,
+                        });
+                    }
+                }
+            }
         }
 
         let events = ctx.input(|i| i.events.clone());
@@ -85,13 +107,17 @@ impl InputHandler {
             match event {
                 // Key press / release
                 Event::Key { key, pressed, repeat, modifiers: _, .. } => {
-                    // Right Control or F12 toggles confinement
+                    // F10 toggles in-game HUD overlay
                     if key == Key::F10 && pressed && !repeat {
                         self.show_hud = !self.show_hud;
                         continue;
                     }
 
-                    // Check for Right-Ctrl or escape release
+                    // F12 toggles pointer confinement; Escape releases it
+                    if key == Key::F12 && pressed && !repeat {
+                        self.toggle_confinement();
+                        continue;
+                    }
                     if key == Key::Escape && pressed && self.is_confined() {
                         self.set_confined(false);
                         continue;
@@ -138,10 +164,25 @@ impl InputHandler {
                 // Mouse buttons
                 Event::PointerButton { pos, button, pressed, .. } => {
                     if viewport_rect.contains(pos) {
-                        if !self.is_confined() && pressed {
-                            // Clicking into viewport captures cursor
-                            self.set_confined(true);
-                            self.last_cursor_pos = Some(pos);
+                        if !self.is_confined() {
+                            // Ensure cursor is positioned at click location before button event
+                            let rel_x = (pos.x - viewport_rect.left()) / viewport_rect.width();
+                            let rel_y = (pos.y - viewport_rect.top()) / viewport_rect.height();
+                            let abs_x = (rel_x.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                            let abs_y = (rel_y.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                            session.send_input(MsgInputEvent {
+                                event_type: INPUT_TYPE_MOUSE_ABS,
+                                param1: 0,
+                                param2: abs_x as i16,
+                                param3: abs_y as i16,
+                                key_down: 0,
+                            });
+                        }
+
+                        // Middle click toggles pointer confinement
+                        if button == PointerButton::Middle && pressed {
+                            self.toggle_confinement();
+                            continue;
                         }
 
                         let btn_flag: u16 = match button {

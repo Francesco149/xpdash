@@ -17,7 +17,21 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <stdint.h>
+#include <stdio.h>
 
+static void hook_log(const char *fmt, ...) {
+    FILE *f = fopen("C:\\xpdash\\hook.log", "a");
+    if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "\n");
+    fclose(f);
+}
 /* ─── Shared Memory Layout ────────────────────────────────────────────── */
 
 #define XPDASH_HOOK_SHM_NAME   "XpDashHookShm"
@@ -54,7 +68,6 @@ typedef struct {
 #define VTBL_IDX_PRESENT      17
 #define VTBL_IDX_GETBACKBUF   18
 #define VTBL_IDX_ENDSCENE     42
-
 /* ─── Function pointer types ──────────────────────────────────────────── */
 
 typedef HRESULT (WINAPI *Present_t)(IDirect3DDevice9 *dev,
@@ -68,7 +81,7 @@ typedef HRESULT (WINAPI *Reset_t)(IDirect3DDevice9 *dev,
 static Present_t  g_orig_present  = NULL;
 static EndScene_t g_orig_endscene = NULL;
 static Reset_t    g_orig_reset    = NULL;
-
+static void     **g_hooked_vtable = NULL;
 static HANDLE  g_shm_handle = NULL;
 static void   *g_shm_ptr    = NULL;
 static HANDLE  g_frame_event = NULL;  /* signaled when a frame is ready */
@@ -125,42 +138,84 @@ static void shm_shutdown(void) {
 }
 
 /* ─── System Memory Surface Management ────────────────────────────────── */
+static IDirect3DSurface9 *g_resolve_surf = NULL;
+static D3DFORMAT g_surf_format = D3DFMT_UNKNOWN;
 
 static void release_sysmem_surf(void) {
     if (g_sysmem_surf) {
         g_sysmem_surf->lpVtbl->Release(g_sysmem_surf);
         g_sysmem_surf = NULL;
     }
+    if (g_resolve_surf) {
+        g_resolve_surf->lpVtbl->Release(g_resolve_surf);
+        g_resolve_surf = NULL;
+    }
     g_surf_width = 0;
     g_surf_height = 0;
+    g_surf_format = D3DFMT_UNKNOWN;
 }
 
-static int ensure_sysmem_surf(IDirect3DDevice9 *dev, uint32_t w, uint32_t h) {
-    if (g_sysmem_surf && g_surf_width == w && g_surf_height == h)
+static int ensure_sysmem_surf(IDirect3DDevice9 *dev, uint32_t w, uint32_t h, D3DFORMAT fmt) {
+    if (g_sysmem_surf && g_surf_width == w && g_surf_height == h && g_surf_format == fmt)
         return 1;
 
     release_sysmem_surf();
 
-    /* D3DFMT_X8R8G8B8 = 32-bit XRGB, matches most game back buffers */
     HRESULT hr = dev->lpVtbl->CreateOffscreenPlainSurface(
-        dev, w, h, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &g_sysmem_surf, NULL);
-    if (FAILED(hr) || !g_sysmem_surf)
+        dev, w, h, fmt, D3DPOOL_SYSTEMMEM, &g_sysmem_surf, NULL);
+    if (FAILED(hr) || !g_sysmem_surf) {
+        hook_log("ensure_sysmem_surf: CreateOffscreenPlainSurface failed %ux%u fmt=%u hr=0x%08lX",
+                 w, h, (unsigned int)fmt, (unsigned long)hr);
         return 0;
+    }
 
     g_surf_width = w;
     g_surf_height = h;
+    g_surf_format = fmt;
     return 1;
 }
 
+static int ensure_resolve_surf(IDirect3DDevice9 *dev, uint32_t w, uint32_t h, D3DFORMAT fmt) {
+    if (g_resolve_surf && g_surf_width == w && g_surf_height == h && g_surf_format == fmt)
+        return 1;
+
+    if (g_resolve_surf) {
+        g_resolve_surf->lpVtbl->Release(g_resolve_surf);
+        g_resolve_surf = NULL;
+    }
+
+    HRESULT hr = dev->lpVtbl->CreateRenderTarget(
+        dev, w, h, fmt, D3DMULTISAMPLE_NONE, 0, FALSE, &g_resolve_surf, NULL);
+    if (FAILED(hr) || !g_resolve_surf) {
+        hook_log("ensure_resolve_surf: CreateRenderTarget failed %ux%u fmt=%u hr=0x%08lX",
+                 w, h, (unsigned int)fmt, (unsigned long)hr);
+        return 0;
+    }
+    return 1;
+}
 /* ─── Frame Capture ───────────────────────────────────────────────────── */
 
 static void capture_backbuffer(IDirect3DDevice9 *dev) {
-    if (!g_shm_ptr || !g_frame_event) return;
+    if (!g_shm_ptr || !g_frame_event) {
+        static int s_logged_no_shm = 0;
+        if (!s_logged_no_shm) {
+            hook_log("capture_backbuffer: no SHM (%p) or frame_event (%p)", g_shm_ptr, g_frame_event);
+            s_logged_no_shm = 1;
+        }
+        return;
+    }
 
     IDirect3DSurface9 *back_buf = NULL;
     HRESULT hr = dev->lpVtbl->GetBackBuffer(dev, 0, 0,
                                              D3DBACKBUFFER_TYPE_MONO, &back_buf);
-    if (FAILED(hr) || !back_buf) return;
+    if (FAILED(hr) || !back_buf) {
+        static int s_logged_bb_fail = 0;
+        if (!s_logged_bb_fail) {
+            hook_log("capture_backbuffer: GetBackBuffer failed hr=0x%08lX", (unsigned long)hr);
+            s_logged_bb_fail = 1;
+        }
+        return;
+    }
 
     /* Get back buffer dimensions */
     D3DSURFACE_DESC desc;
@@ -170,21 +225,63 @@ static void capture_backbuffer(IDirect3DDevice9 *dev) {
         return;
     }
 
-    /* Ensure our system memory surface matches */
-    if (!ensure_sysmem_surf(dev, desc.Width, desc.Height)) {
+    static int s_logged_desc = 0;
+    if (!s_logged_desc) {
+        hook_log("capture_backbuffer: backbuffer %ux%u, format=%u, multisample=%u",
+                 desc.Width, desc.Height, (unsigned int)desc.Format, (unsigned int)desc.MultiSampleType);
+        s_logged_desc = 1;
+    }
+
+    /* Ensure our system memory surface matches format and dimensions */
+    if (!ensure_sysmem_surf(dev, desc.Width, desc.Height, desc.Format)) {
         back_buf->lpVtbl->Release(back_buf);
         return;
     }
 
+    IDirect3DSurface9 *src_surf = back_buf;
+    if (desc.MultiSampleType != D3DMULTISAMPLE_NONE) {
+        /* Resolve multisampled backbuffer via StretchRect to non-MSAA target */
+        if (!ensure_resolve_surf(dev, desc.Width, desc.Height, desc.Format)) {
+            back_buf->lpVtbl->Release(back_buf);
+            return;
+        }
+        HRESULT hr_sr = dev->lpVtbl->StretchRect(dev, back_buf, NULL, g_resolve_surf, NULL, D3DTEXF_NONE);
+        if (FAILED(hr_sr)) {
+            static int s_logged_sr_fail = 0;
+            if (!s_logged_sr_fail) {
+                hook_log("capture_backbuffer: StretchRect resolve failed hr=0x%08lX", (unsigned long)hr_sr);
+                s_logged_sr_fail = 1;
+            }
+            back_buf->lpVtbl->Release(back_buf);
+            return;
+        }
+        src_surf = g_resolve_surf;
+    }
+
     /* GPU → system memory copy */
-    hr = dev->lpVtbl->GetRenderTargetData(dev, back_buf, g_sysmem_surf);
+    hr = dev->lpVtbl->GetRenderTargetData(dev, src_surf, g_sysmem_surf);
     back_buf->lpVtbl->Release(back_buf);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        static int s_logged_rt_fail = 0;
+        if (!s_logged_rt_fail) {
+            hook_log("capture_backbuffer: GetRenderTargetData failed hr=0x%08lX (src=%p, dst=%p)",
+                     (unsigned long)hr, src_surf, g_sysmem_surf);
+            s_logged_rt_fail = 1;
+        }
+        return;
+    }
 
     /* Lock and copy to shared memory */
     D3DLOCKED_RECT lr;
     hr = g_sysmem_surf->lpVtbl->LockRect(g_sysmem_surf, &lr, NULL, D3DLOCK_READONLY);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        static int s_logged_lock_fail = 0;
+        if (!s_logged_lock_fail) {
+            hook_log("capture_backbuffer: LockRect failed hr=0x%08lX", (unsigned long)hr);
+            s_logged_lock_fail = 1;
+        }
+        return;
+    }
 
     uint32_t w = desc.Width;
     uint32_t h = desc.Height;
@@ -226,6 +323,12 @@ static void capture_backbuffer(IDirect3DDevice9 *dev) {
     SetEvent(g_frame_event);
 
     g_sysmem_surf->lpVtbl->UnlockRect(g_sysmem_surf);
+
+    static uint32_t s_log_count = 0;
+    if (s_log_count++ == 0) {
+        hook_log("capture_backbuffer: first frame captured! %ux%u stride=%u, frame_idx=%lu",
+                 w, h, row_bytes, g_frame_idx);
+    }
 }
 
 /* ─── Hooked Functions ────────────────────────────────────────────────── */
@@ -233,6 +336,10 @@ static void capture_backbuffer(IDirect3DDevice9 *dev) {
 static HRESULT WINAPI hook_present(IDirect3DDevice9 *dev,
     const RECT *src, const RECT *dst, HWND hWnd, const RGNDATA *dirty)
 {
+    static uint32_t s_present_calls = 0;
+    if (s_present_calls++ == 0) {
+        hook_log("hook_present: first call! dev=%p, hWnd=%p", dev, hWnd);
+    }
     /* Capture BEFORE the original Present — back buffer is complete */
     EnterCriticalSection(&g_cs);
     capture_backbuffer(dev);
@@ -268,26 +375,60 @@ static int hook_vtable(void **vtable, int index, void *hook, void **original) {
 }
 
 static int install_hooks(void) {
-    /* Create a temporary D3D9 device to discover the vtable layout.
-       This is the standard technique used by FRAPS, OBS, Steam overlay. */
+    hook_log("install_hooks: starting hook installation in PID %lu", GetCurrentProcessId());
+
+    /* Method 1: Direct check for RenderWare games (GTA San Andreas v1.0) */
+    IDirect3DDevice9 **ppDev = (IDirect3DDevice9 **)0x00C97C28;
+    if (!IsBadReadPtr(ppDev, sizeof(void *)) && *ppDev != NULL) {
+        IDirect3DDevice9 *dev = *ppDev;
+        if (!IsBadReadPtr(dev, sizeof(void *))) {
+            void **vtable = *(void ***)dev;
+            if (!IsBadReadPtr(vtable, sizeof(void *) * 43)) {
+                hook_log("install_hooks: found active RenderWare D3D9 device at %p (vtable=%p)", dev, vtable);
+                g_hooked_vtable = vtable;
+                int ok = 1;
+                ok &= hook_vtable(vtable, VTBL_IDX_PRESENT, (void *)hook_present,
+                                  (void **)&g_orig_present);
+                ok &= hook_vtable(vtable, VTBL_IDX_RESET, (void *)hook_reset,
+                                  (void **)&g_orig_reset);
+                if (ok) {
+                    hook_log("install_hooks: RenderWare D3D9 device hooked successfully (orig_present=%p)",
+                             g_orig_present);
+                    return 1;
+                } else {
+                    hook_log("install_hooks: hook_vtable failed for RenderWare device");
+                }
+            }
+        }
+    }
+
+    /* Method 2: Temporary D3D9 device creation (windowed apps & desktop fallback) */
+    hook_log("install_hooks: attempting dummy device creation");
     HMODULE hd3d9 = LoadLibraryA("d3d9.dll");
-    if (!hd3d9) return 0;
+    if (!hd3d9) {
+        hook_log("install_hooks: LoadLibraryA(d3d9.dll) failed, err=%lu", GetLastError());
+        return 0;
+    }
 
     typedef IDirect3D9 *(WINAPI *Direct3DCreate9_t)(UINT SDKVersion);
-    Direct3DCreate9_t pCreate9 = (Direct3DCreate9_t)
-        GetProcAddress(hd3d9, "Direct3DCreate9");
-    if (!pCreate9) return 0;
+    Direct3DCreate9_t pCreate9 = (Direct3DCreate9_t)GetProcAddress(hd3d9, "Direct3DCreate9");
+    if (!pCreate9) {
+        hook_log("install_hooks: GetProcAddress(Direct3DCreate9) failed");
+        return 0;
+    }
 
     IDirect3D9 *d3d9 = pCreate9(D3D_SDK_VERSION);
-    if (!d3d9) return 0;
+    if (!d3d9) {
+        hook_log("install_hooks: Direct3DCreate9 failed");
+        return 0;
+    }
 
-    /* We need a window for CreateDevice */
     HWND hwnd = CreateWindowExA(0, "STATIC", "xpdash_hook_tmp",
                                 WS_OVERLAPPEDWINDOW, 0, 0, 1, 1,
                                 NULL, NULL, GetModuleHandle(NULL), NULL);
     if (!hwnd) {
-        d3d9->lpVtbl->Release(d3d9);
-        return 0;
+        hwnd = GetDesktopWindow();
+        hook_log("install_hooks: CreateWindowExA failed, using GetDesktopWindow=%p", hwnd);
     }
 
     D3DPRESENT_PARAMETERS pp;
@@ -302,47 +443,62 @@ static int install_hooks(void) {
     HRESULT hr = d3d9->lpVtbl->CreateDevice(
         d3d9, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
         D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
+    hook_log("install_hooks: CreateDevice(HAL) hr=0x%08lX, dev=%p", (unsigned long)hr, dev);
     if (FAILED(hr) || !dev) {
-        /* Try NULLREF device — some systems fail HAL for dummy windows */
         hr = d3d9->lpVtbl->CreateDevice(
             d3d9, D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, hwnd,
             D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
+        hook_log("install_hooks: CreateDevice(NULLREF) hr=0x%08lX, dev=%p", (unsigned long)hr, dev);
         if (FAILED(hr) || !dev) {
             d3d9->lpVtbl->Release(d3d9);
-            DestroyWindow(hwnd);
+            if (hwnd && hwnd != GetDesktopWindow()) DestroyWindow(hwnd);
             return 0;
         }
     }
 
-    /* Get the vtable from the device */
     void **vtable = *(void ***)dev;
+    hook_log("install_hooks: dummy device created, vtable=%p", vtable);
 
-    /* Hook Present (17) and Reset (16) */
+    g_hooked_vtable = vtable;
     int ok = 1;
     ok &= hook_vtable(vtable, VTBL_IDX_PRESENT, (void *)hook_present,
                       (void **)&g_orig_present);
     ok &= hook_vtable(vtable, VTBL_IDX_RESET, (void *)hook_reset,
                       (void **)&g_orig_reset);
-
-    /* Release the temp device and D3D9 — vtable addresses are global
-       (all devices in this process share the same vtable because d3d9.dll
-       is loaded once). The hooks persist after release. */
     dev->lpVtbl->Release(dev);
     d3d9->lpVtbl->Release(d3d9);
-    DestroyWindow(hwnd);
+    if (hwnd && hwnd != GetDesktopWindow()) DestroyWindow(hwnd);
 
+    hook_log("install_hooks: dummy device hooking result=%d (orig_present=%p)", ok, g_orig_present);
     return ok;
 }
 
 static void remove_hooks(void) {
-    /* Restore original function pointers. We can't know the current vtable
-       address without a live device, so we just clear our state. The process
-       is exiting or unloading anyway. */
+    /* Restore original function pointers so process continues cleanly */
+    if (g_hooked_vtable && g_orig_present) {
+        DWORD old_protect;
+        if (VirtualProtect(&g_hooked_vtable[VTBL_IDX_PRESENT], sizeof(void *),
+                            PAGE_EXECUTE_READWRITE, &old_protect)) {
+            g_hooked_vtable[VTBL_IDX_PRESENT] = (void *)g_orig_present;
+            VirtualProtect(&g_hooked_vtable[VTBL_IDX_PRESENT], sizeof(void *),
+                            old_protect, &old_protect);
+        }
+    }
+    if (g_hooked_vtable && g_orig_reset) {
+        DWORD old_protect;
+        if (VirtualProtect(&g_hooked_vtable[VTBL_IDX_RESET], sizeof(void *),
+                            PAGE_EXECUTE_READWRITE, &old_protect)) {
+            g_hooked_vtable[VTBL_IDX_RESET] = (void *)g_orig_reset;
+            VirtualProtect(&g_hooked_vtable[VTBL_IDX_RESET], sizeof(void *),
+                            old_protect, &old_protect);
+        }
+    }
+    hook_log("remove_hooks: vtable restored cleanly");
+    g_hooked_vtable = NULL;
     g_orig_present  = NULL;
     g_orig_endscene = NULL;
     g_orig_reset    = NULL;
 }
-
 /* ─── DLL Entry Point ─────────────────────────────────────────────────── */
 
 static HANDLE g_init_thread = NULL;

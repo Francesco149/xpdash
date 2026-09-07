@@ -104,6 +104,13 @@ static DWORD find_d3d9_process(void) {
     do {
         if (pe.th32ProcessID == my_pid) continue;
         if (pe.th32ProcessID <= 4) continue;  /* system processes */
+        /* Direct match for known D3D9 game executables without needing module snapshot */
+        if (lstrcmpiA(pe.szExeFile, "gta_sa.exe") == 0) {
+            found_pid = pe.th32ProcessID;
+            agent_log("d3d9hook: found known D3D9 game: %s (PID %lu)",
+                      pe.szExeFile, (unsigned long)found_pid);
+            break;
+        }
 
         /* Check if this process has d3d9.dll loaded */
         HANDLE modsnap = CreateToolhelp32Snapshot(
@@ -133,9 +140,16 @@ static DWORD find_d3d9_process(void) {
 
 int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
     if (g_injected_proc) {
-        agent_log("d3d9hook_inject: already injected into PID %lu",
+        DWORD code = 0;
+        if (GetExitCodeProcess(g_injected_proc, &code) && code == STILL_ACTIVE) {
+            return 1;
+        }
+        agent_log("d3d9hook_inject: previously injected PID %lu exited, cleaning up",
                   (unsigned long)g_injected_pid);
-        return 1;
+        close_shm();
+        CloseHandle(g_injected_proc);
+        g_injected_proc = NULL;
+        g_injected_pid = 0;
     }
 
     /* Auto-detect if no PID given */
@@ -241,6 +255,20 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
 /* ─── Frame Reading ───────────────────────────────────────────────────── */
 
 int d3d9hook_is_active(void) {
+    /* Always check if the injected process is still alive FIRST */
+    if (g_injected_proc) {
+        DWORD code = 0;
+        if (GetExitCodeProcess(g_injected_proc, &code) && code != STILL_ACTIVE) {
+            agent_log("d3d9hook: injected process PID %lu exited (code=%lu)",
+                      (unsigned long)g_injected_pid, (unsigned long)code);
+            close_shm();
+            CloseHandle(g_injected_proc);
+            g_injected_proc = NULL;
+            g_injected_pid = 0;
+            return 0;
+        }
+    }
+
     /* Try to open SHM if not already open */
     if (!g_shm_ptr) {
         if (!open_shm()) return 0;
@@ -249,19 +277,6 @@ int d3d9hook_is_active(void) {
     HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
     if (hdr->magic != 0x48443344) return 0;
     if (!hdr->hook_active) return 0;
-
-    /* Check if the injected process is still alive */
-    if (g_injected_proc) {
-        DWORD code;
-        if (GetExitCodeProcess(g_injected_proc, &code) && code != STILL_ACTIVE) {
-            agent_log("d3d9hook: injected process exited (code=%lu)", (unsigned long)code);
-            close_shm();
-            CloseHandle(g_injected_proc);
-            g_injected_proc = NULL;
-            g_injected_pid = 0;
-            return 0;
-        }
-    }
 
     return 1;
 }

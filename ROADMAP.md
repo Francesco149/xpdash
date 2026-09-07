@@ -319,6 +319,25 @@ The initial bandaid pass (VSync removal, TCP_NODELAY, ring buffer resize, dirty-
 - ✅ 8KB UDP chunk size for fewer sendto() syscalls.
 
 
+### Windows XP Graphics API Universal Test Matrix & Capture Architecture
+
+To guarantee moonlight-grade reliability across all legacy software without requiring kernel-mode display drivers, xpdash implements targeted, zero-copy presentation hooks for each distinct Windows XP rendering pipeline:
+
+| Graphics API | Target Mechanism / Entry Point | Pixel Format Handling | Representative Test Applications |
+|---|---|---|---|
+| **Direct3D 9 / 9c** (Exclusive Fullscreen) | `IDirect3DDevice9::Present` (vtable 17) via `xpdash-hook.dll` | `GetRenderTargetData` GPU→SystemMem, X8R8G8B8 | *Grand Theft Auto: San Andreas* (v1.0), *Half-Life 2*, *Need for Speed: Most Wanted* |
+| **Direct3D 9 / 9c** (Windowed / Borderless) | `IDirect3DDevice9::Present` + dummy device fallback | Shared mem double-buffered | *Warcraft III: The Frozen Throne* (v1.27b), *D3D9 SDK Samples*, *3DMark05* |
+| **Direct3D 8** | `IDirect3DDevice8::Present` (vtable 15) or `d3d8to9` wrapper | Native D3D8 surface copy | *Max Payne 1 & 2*, *GTA: Vice City*, *Mafia: The City of Lost Heaven*, *Halo: Combat Evolved* |
+| **DirectDraw 7 / D3D7** (2D & Fixed-Function) | `IDirectDrawSurface7::Flip` & `Blt` in `ddraw.dll` | 8-bit paletted (`P8`) & 16-bit (`RGB565`) expanded to 32-bit BGRX | *StarCraft: Brood War* (640×480 8-bit), *Diablo II* (DirectDraw), *Age of Empires II*, *Red Alert 2* |
+| **OpenGL 1.1–2.1** | `wglSwapBuffers` in `opengl32.dll` / `gdi32.dll` | `glReadPixels(GL_BGRA_EXT)` or PBO asynchronous transfer | *Quake III Arena* (v1.32), *Doom 3*, *Return to Castle Wolfenstein*, *Half-Life 1* (GoldSrc) |
+| **Glide 2x / 3x** (3dfx) | `grBufferSwap` in `glide2x.dll` / `glide3x.dll` or nGlide wrapper | 16-bit 565 buffer copy | *Diablo II* (Glide mode), *Unreal* (Glide renderer), *Need for Speed II SE* |
+| **GDI / DirectShow Video Overlay** | VBlank-synced `BitBlt` (`WaitForVerticalBlank` + `CreateDIBSection`) | 32-bit BGRX TurboJPEG quality 85 | Windows Desktop Explorer, *Windows Media Player 9/11*, *Kirikiri Visual Novels* |
+
+#### Validation Suite Requirements for Wild Windows XP Scenarios:
+1. **Resolution Switching**: Dynamic resolution change handling (`WM_DISPLAYCHANGE` + `Reset` hook) without stream disconnection or texture corruption (e.g. game launching at 640×480 then switching to 1024×768).
+2. **Color Depth Modes**: Palette expansion for 8-bit (256 colors) and 16-bit (High Color 565/555) games into standard BGRX before JPEG encoding.
+3. **Cursor State Consistency**: Automatic cursor suppression when games invoke `ShowCursor(FALSE)` or DirectInput exclusive mode, with seamless host cursor alignment on unconfined desktop navigation.
+
 ## Future Sessions (Sessions 8 to 11): Advanced Input, Shaders & Packaging
 ### Session 8: Input Confinement & Modifier Routing Engine
 - Implement relative pointer confinement (pointer lock) with visual state indicator and configurable release hotkey (default `Right-Ctrl`).

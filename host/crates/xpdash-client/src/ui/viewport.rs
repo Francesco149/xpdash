@@ -76,9 +76,9 @@ impl StreamViewport {
             }
         }
 
-        // 2. Cursor icon: Crosshair when confined, Default when unconfined
+        // 2. Cursor icon: None when confined (game renders or hides its own cursor), Default when unconfined
         if input.is_confined() {
-            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            ctx.set_cursor_icon(egui::CursorIcon::None);
         } else {
             ctx.set_cursor_icon(egui::CursorIcon::Default);
         }

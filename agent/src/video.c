@@ -68,9 +68,12 @@ static void draw_cursor(HDC hdc) {
                       ci.flags, ci.hCursor, ci.ptScreenPos.x, ci.ptScreenPos.y);
             s_logged_cursor = 1;
         }
-        /* Always composite cursor — DirectX fullscreen games hide the system
-           cursor (CURSOR_SHOWING=0) but GetCursorInfo still reports position.
-           Without this, the cursor is invisible in games like GTA SA. */
+        /* Only composite cursor if application/OS currently shows it.
+           Fullscreen games that hide the cursor (e.g. GTA SA gameplay) set
+           CURSOR_SHOWING=0 — in that case we must NOT draw any cursor. */
+        if (!(ci.flags & CURSOR_SHOWING)) {
+            return;
+        }
         HCURSOR hCur = ci.hCursor;
         if (!hCur) {
             hCur = LoadCursor(NULL, IDC_ARROW);
@@ -126,18 +129,20 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
 
     while (g_video_running) {
         if (net_is_streaming_active()) {
-            /* VSync-synchronized capture: wait for the vertical blanking
-               interval, then BitBlt immediately. During VBlank the front
-               buffer is stable — the game has finished Present() and hasn't
-               started the next Clear/Draw yet. This eliminates mid-render
-               flicker for all content (desktop, windowed, fullscreen). */
-            if (g_pdd) {
-                vblank_wait();
+            if (d3d9hook_is_active()) {
+                /* Hook frames are driven by the game's Present() via d3d9hook_read_frame()'s
+                   internal event wait. Do not wait on DirectDraw VBlank here which would cause
+                   aliasing and jitter against the game's internal frame rate. */
+                video_capture();
             } else {
-                /* No DirectDraw — fall back to fixed interval */
-                Sleep(16);
+                /* GDI BitBlt fallback: wait for hardware VBlank to avoid mid-render tearing */
+                if (g_pdd) {
+                    vblank_wait();
+                } else {
+                    Sleep(16);
+                }
+                video_capture();
             }
-            video_capture();
         } else {
             Sleep(50);
         }
