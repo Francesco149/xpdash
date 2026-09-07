@@ -62,7 +62,7 @@ impl InputHandler {
         // Enforce OS cursor lock mode
         if self.is_confined() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
 
             // Continuous relative hardware delta tracking (never clamped by window borders)
             let delta = ctx.input(|i| i.pointer.delta());

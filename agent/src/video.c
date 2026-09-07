@@ -14,23 +14,42 @@ static LPDIRECTDRAW g_pdd = NULL;
 static void vblank_init(void) {
     if (g_pdd) return;
     g_h_ddraw = LoadLibraryA("ddraw.dll");
-    if (!g_h_ddraw) return;
+    if (!g_h_ddraw) {
+        agent_log("vblank_init: LoadLibraryA(ddraw.dll) failed, err=%lu", GetLastError());
+        return;
+    }
 
     typedef HRESULT (WINAPI *DirectDrawCreate_fn)(GUID *lpGUID, LPDIRECTDRAW *lplpDD, IUnknown *pUnkOuter);
     DirectDrawCreate_fn pfnDirectDrawCreate = (DirectDrawCreate_fn)GetProcAddress(g_h_ddraw, "DirectDrawCreate");
-    if (!pfnDirectDrawCreate) return;
+    if (!pfnDirectDrawCreate) {
+        agent_log("vblank_init: GetProcAddress(DirectDrawCreate) failed, err=%lu", GetLastError());
+        return;
+    }
 
     LPDIRECTDRAW pdd = NULL;
-    if (pfnDirectDrawCreate(NULL, &pdd, NULL) == DD_OK && pdd) {
-        pdd->lpVtbl->SetCooperativeLevel(pdd, NULL, DDSCL_NORMAL);
-        g_pdd = pdd;
-        agent_log("video_init: DirectDraw hardware VSync synchronization initialized");
+    HRESULT hr = pfnDirectDrawCreate(NULL, &pdd, NULL);
+    if (FAILED(hr) || !pdd) {
+        agent_log("vblank_init: DirectDrawCreate failed hr=0x%08lX", (unsigned long)hr);
+        return;
     }
+    pdd->lpVtbl->SetCooperativeLevel(pdd, NULL, DDSCL_NORMAL);
+    g_pdd = pdd;
+    agent_log("vblank_init: DirectDraw hardware VSync synchronization initialized (pdd=%p)", g_pdd);
 }
 
 static void vblank_wait(void) {
     if (g_pdd) {
-        g_pdd->lpVtbl->WaitForVerticalBlank(g_pdd, DDWAITVB_BLOCKBEGIN, NULL);
+        // Wait for current vertical blank to complete, then wait for the start of the next blank.
+        // This ensures capture begins exactly at the start of scanline 0.
+        g_pdd->lpVtbl->WaitForVerticalBlank(g_pdd, DDWAITVB_BLOCKEND, NULL);
+        HRESULT hr = g_pdd->lpVtbl->WaitForVerticalBlank(g_pdd, DDWAITVB_BLOCKBEGIN, NULL);
+        if (FAILED(hr)) {
+            static int s_logged_vb_fail = 0;
+            if (!s_logged_vb_fail) {
+                agent_log("vblank_wait: WaitForVerticalBlank failed hr=0x%08lX", (unsigned long)hr);
+                s_logged_vb_fail = 1;
+            }
+        }
     }
 }
 
@@ -39,6 +58,12 @@ static void draw_cursor(HDC hdc) {
     memset(&ci, 0, sizeof(ci));
     ci.cbSize = sizeof(CURSORINFO);
     if (GetCursorInfo(&ci)) {
+        static int s_logged_cursor = 0;
+        if (!s_logged_cursor) {
+            agent_log("draw_cursor: first call! flags=0x%lx, hCursor=%p, pos=(%ld,%ld)",
+                      ci.flags, ci.hCursor, ci.ptScreenPos.x, ci.ptScreenPos.y);
+            s_logged_cursor = 1;
+        }
         if (ci.flags & CURSOR_SHOWING) {
             ICONINFO ii;
             memset(&ii, 0, sizeof(ii));
@@ -49,6 +74,12 @@ static void draw_cursor(HDC hdc) {
                 if (ii.hbmMask) DeleteObject(ii.hbmMask);
                 if (ii.hbmColor) DeleteObject(ii.hbmColor);
             }
+        }
+    } else {
+        static int s_logged_ci_fail = 0;
+        if (!s_logged_ci_fail) {
+            agent_log("draw_cursor: GetCursorInfo failed! err=%lu", GetLastError());
+            s_logged_ci_fail = 1;
         }
     }
 }

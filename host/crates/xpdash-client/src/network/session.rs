@@ -278,16 +278,54 @@ async fn run_media_receiver(
     let socket = UdpSocket::from_std(std_sock)?;
     log::info!("Media receiver listening on UDP port {} (8MB buffer).", UDP_MEDIA_PORT);
 
+    struct CompressedFrame {
+        frame_index: u32,
+        width: u16,
+        height: u16,
+        codec: u8,
+        compressed_data: Vec<u8>,
+    }
+
+    let (decompress_tx, mut decompress_rx) = tokio::sync::mpsc::channel::<CompressedFrame>(8);
+    let frame_sink = latest_frame.clone();
+    let metrics_worker = metrics.clone();
+
+    tokio::task::spawn_blocking(move || {
+        while let Some(item) = decompress_rx.blocking_recv() {
+            if item.codec == 2 {
+                let uncompressed_len = (item.width as usize) * (item.height as usize) * 4;
+                if let Ok(mut rgba) = lz4_flex::decompress(&item.compressed_data, uncompressed_len) {
+                    for chunk in rgba.chunks_exact_mut(4) {
+                        let b = chunk[0];
+                        let r = chunk[2];
+                        chunk[0] = r;
+                        chunk[2] = b;
+                        chunk[3] = 255;
+                    }
+
+                    let frame = VideoFrame {
+                        width: item.width,
+                        height: item.height,
+                        frame_index: item.frame_index,
+                        rgba_pixels: Arc::new(rgba),
+                    };
+
+                    *frame_sink.write() = Some(frame);
+                    metrics_worker.write().video_frames_rx += 1;
+                }
+            }
+        }
+    });
+
     let mut audio_clock = PtsClock::new(100);
     let mut video_frames: HashMap<u32, PartialVideoFrame> = HashMap::new();
-
-    let mut buf = [0u8; 2048];
     let mut last_stats = Instant::now();
     let mut bytes_in_window: u64 = 0;
     let mut frames_in_window: u64 = 0;
     let mut total_jitter_abs: f64 = 0.0;
     let mut jitter_samples: u64 = 0;
 
+    let mut buf = [0u8; 2048];
     while running.load(Ordering::Relaxed) {
         let (len, _src) = match socket.recv_from(&mut buf).await {
             Ok(res) => res,
@@ -331,39 +369,21 @@ async fn run_media_receiver(
                         entry.received_chunks.insert(vh.chunk_index, chunk_data.to_vec());
 
                         if entry.received_chunks.len() == entry.total_chunks as usize {
-                            // Reassemble and decompress
-                            let mut compressed = Vec::new();
+                            frames_in_window += 1;
+                            let mut compressed = Vec::with_capacity(entry.total_chunks as usize * 1370);
                             for c in 0..entry.total_chunks {
                                 if let Some(part) = entry.received_chunks.get(&c) {
                                     compressed.extend_from_slice(part);
                                 }
                             }
 
-                            if vh.codec == 2 {
-                                let uncompressed_len = (entry.width as usize) * (entry.height as usize) * 4;
-                                if let Ok(decompressed) = lz4_flex::decompress(&compressed, uncompressed_len) {
-                                    frames_in_window += 1;
-                                    // Convert BGRA to RGBA in-place into an Arc buffer
-                                    let mut rgba = decompressed;
-                                    for chunk in rgba.chunks_exact_mut(4) {
-                                        let b = chunk[0];
-                                        let r = chunk[2];
-                                        chunk[0] = r;
-                                        chunk[2] = b;
-                                        chunk[3] = 255;
-                                    }
-
-                                    let frame = VideoFrame {
-                                        width: entry.width,
-                                        height: entry.height,
-                                        frame_index: vh.frame_index,
-                                        rgba_pixels: Arc::new(rgba),
-                                    };
-
-                                    *latest_frame.write() = Some(frame);
-                                    metrics.write().video_frames_rx += 1;
-                                }
-                            }
+                            let _ = decompress_tx.try_send(CompressedFrame {
+                                frame_index: vh.frame_index,
+                                width: entry.width,
+                                height: entry.height,
+                                codec: vh.codec,
+                                compressed_data: compressed,
+                            });
 
                             video_frames.remove(&vh.frame_index);
                         }

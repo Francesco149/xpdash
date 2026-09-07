@@ -52,10 +52,11 @@ impl StreamViewport {
         if let Some(ref frame) = latest {
             if frame.frame_index != self.last_frame_index || self.texture.is_none() {
                 self.last_frame_index = frame.frame_index;
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba_pixels,
-                );
+                let pixels: &[egui::Color32] = bytemuck::cast_slice(&frame.rgba_pixels);
+                let color_image = egui::ColorImage {
+                    size: [frame.width as usize, frame.height as usize],
+                    pixels: pixels.to_vec(),
+                };
 
                 let tex_options = match self.aspect_mode {
                     AspectRatioMode::Integer1x | AspectRatioMode::Integer2x => TextureOptions::NEAREST,
@@ -71,9 +72,11 @@ impl StreamViewport {
             }
         }
 
-        // 2. Hide cursor if confined
+        // 2. Cursor icon: Crosshair when confined, Default when unconfined
         if input.is_confined() {
-            ctx.set_cursor_icon(egui::CursorIcon::None);
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else {
+            ctx.set_cursor_icon(egui::CursorIcon::Default);
         }
 
         // 3. Compute Viewport Rectangle based on Aspect Ratio mode
