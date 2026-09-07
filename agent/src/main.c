@@ -86,6 +86,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
 
     agent_log("=== xpdash-agent starting ===");
+    timeBeginPeriod(1);
     g_hwnd = create_message_window(hInstance);
     agent_log("create_message_window: hwnd=%p", g_hwnd);
 
@@ -136,6 +137,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         DestroyWindow(g_hwnd);
         g_hwnd = NULL;
     }
+    timeEndPeriod(1);
 
     agent_log("=== xpdash-agent stopped ===");
     return 0;

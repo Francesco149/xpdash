@@ -257,10 +257,6 @@ int net_send_video_frame(const uint8_t *comp_data, uint32_t comp_size,
 
         offset += this_chunk;
 
-        // Sleep 1ms every 24 chunks (~28 KB) to pace network traffic
-        if ((c % 24) == 23) {
-            Sleep(1);
-        }
     }
     return 1;
 }

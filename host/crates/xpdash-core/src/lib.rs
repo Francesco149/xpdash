@@ -461,6 +461,15 @@ impl PtsClock {
 
         true
     }
+
+    /// Calculate the current packet jitter relative to expected clock (in milliseconds).
+    pub fn jitter_ms(&self, pts_ms: u32) -> Option<i32> {
+        let base_remote = self.base_remote_pts?;
+        let base_local = self.base_local_instant?;
+        let elapsed_local_ms = Instant::now().duration_since(base_local).as_millis() as u32;
+        let expected_remote_pts = base_remote.wrapping_add(elapsed_local_ms);
+        Some((pts_ms as i64 - expected_remote_pts as i64) as i32)
+    }
 }
 
 #[cfg(test)]

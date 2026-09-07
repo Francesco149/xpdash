@@ -71,13 +71,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = media_tx.send(()).await;
     });
 
-    // Control message loop
+    // Control message loop with periodic 1s RTT ping
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(1));
+    let mut last_ping_sent: Option<Instant> = None;
     let mut buf = [0u8; 1024];
+
     loop {
         tokio::select! {
             _ = media_rx.recv() => {
                 log::warn!("Media receiver stopped.");
                 break;
+            }
+            _ = ping_interval.tick() => {
+                last_ping_sent = Some(Instant::now());
+                let ping_frame = [OP_PING, 0, 0, 0];
+                let _ = tcp_stream.write_all(&ping_frame).await;
             }
             res = tcp_stream.read(&mut buf) => {
                 let n = match res {
@@ -108,6 +116,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 OP_VIDEO_RESIZE => {
                                     if let Some(res) = MsgVideoResize::parse(payload) {
                                         log::info!("[Display Change] Agent resized to {}x{}@{}bpp", res.new_width, res.new_height, res.new_bpp);
+                                    }
+                                }
+                                OP_PONG => {
+                                    if let Some(sent) = last_ping_sent.take() {
+                                        let rtt = sent.elapsed().as_secs_f64() * 1000.0;
+                                        log::info!("[Latency RTT] Control Round-Trip Time: {:.2} ms", rtt);
                                     }
                                 }
                                 OP_PING => {
@@ -190,16 +204,24 @@ async fn run_media_loop<P: Producer<Item = f32>>(
     let mut video_frames_rx: u64 = 0;
     let mut audio_dropped: u64 = 0;
     let video_dropped: u64 = 0;
-
+    let mut total_jitter_abs: f64 = 0.0;
+    let mut jitter_samples: u64 = 0;
+    let mut bytes_in_window: u64 = 0;
     loop {
         let (len, _src) = socket.recv_from(&mut buf).await?;
         if len < NetPacketHeader::SIZE {
             continue;
         }
+        bytes_in_window += len as u64;
 
         if let Some((nh, payload)) = NetPacketHeader::parse(&buf[..len]) {
             match nh.pkt_type {
                 PacketType::Audio => {
+                    if let Some(j) = audio_clock.jitter_ms(nh.pts_ms) {
+                        total_jitter_abs += j.abs() as f64;
+                        jitter_samples += 1;
+                    }
+
                     // Anti-desync check: drop if late
                     if !audio_clock.is_packet_acceptable(nh.pts_ms) {
                         audio_dropped += 1;
@@ -259,14 +281,17 @@ async fn run_media_loop<P: Producer<Item = f32>>(
             video_frames.clear();
         }
 
-        if last_stats.elapsed() >= Duration::from_secs(3) {
+        if last_stats.elapsed() >= Duration::from_secs(2) {
+            let elapsed = last_stats.elapsed().as_secs_f64();
+            let kbps = (bytes_in_window as f64 * 8.0) / (elapsed * 1000.0);
+            let avg_jitter = if jitter_samples > 0 { total_jitter_abs / jitter_samples as f64 } else { 0.0 };
             log::info!(
-                "[Client Metrics] Audio slices received: {} (dropped: {}), Video frames rendered: {} (dropped: {})",
-                audio_packets_rx,
-                audio_dropped,
-                video_frames_rx,
-                video_dropped
+                "[Media Stream] Video: {} frames ({} dropped) | Audio: {} slices ({:.1} kbps, jitter: ±{:.2}ms, {} dropped)",
+                video_frames_rx, video_dropped, audio_packets_rx, kbps, avg_jitter, audio_dropped
             );
+            bytes_in_window = 0;
+            total_jitter_abs = 0.0;
+            jitter_samples = 0;
             last_stats = Instant::now();
         }
     }
