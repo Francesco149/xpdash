@@ -11,7 +11,7 @@ This document serves as the architectural master plan and session-by-session exe
 | **Session 1** | **Orientation, Toolchain, Hardware Verification & Planning** | **COMPLETED** | Nix devShell, architecture/protocol specs, SB0090 audio/EAX verification, legacy agent uninstallation, EAX test suite scaffold. |
 | **Session 2** | **Windows XP Native Agent Core** | **COMPLETED** | Standalone C agent (`waveIn` 48kHz stereo, DIBSection 800x600, fast LZ4, `SendInput`, UDP/TCP streaming, display change handler, tested on `timemachine`). |
 | **Session 3** | **Host Server & Native Cross-Platform Client** | **COMPLETED** | Rust workspace (`cpal` low-latency audio, `ringbuf`, UDP/TCP receiver, anti-desync clock sync, LZ4 decompression, live E2E streaming). |
-| **Session 4** | **Auto-Discovery, Security & Packaging** | *Pending* | UDP discovery beacons, Ed25519 fingerprinting, interactive XP trust UI, `deploy.sh` and public `install-agent.bat`. |
+| **Session 4** | **Auto-Discovery, Security & Packaging** | **COMPLETED** | UDP discovery beacons, Ed25519 fingerprinting, interactive XP trust UI, `deploy.sh` and public `install-agent.bat`. |
 | **Session 5** | **End-to-End Integration, Soak Testing & Real EAX Games** | *Pending* | Real game EAX testing (UT2004 / Doom 3), 1-hour zero-desync soak test on `timemachine` & `q9650`. |
 
 ---
@@ -82,24 +82,34 @@ This document serves as the architectural master plan and session-by-session exe
    - Connected Linux host to `timemachine` (`10.0.10.113`) over LAN.
    - Verified simultaneous live audio streaming (~1.5 Mbps, 48 kHz stereo PCM) and video streaming (800x600 @ 32bpp, LZ4 compressed frames across 971 chunks) with zero lag drift.
 
-## Session 4: Auto-Discovery, Security & Packaging
+## Session 4: Auto-Discovery, Security & Packaging (COMPLETED)
 
-### Goal
-Implement zero-configuration LAN discovery, security fingerprinting, and public installation packaging.
-
-### Subtasks
-1. **Auto-Discovery**:
-   - Server broadcasts UDP beacon on port 7022 (`XPDASH_BEACON`).
-   - XP agent receives beacon and automatically connects to the server IP.
-2. **Security & Trust Model**:
-   - Ed25519 host keypair generation.
-   - Pre-seeded trusted fingerprint mode for lab rigs (`agent.ini`).
-   - Native XP GUI trust confirmation dialog for unknown servers in public mode.
-3. **Automated Remote Deployment**:
-   - `deploy/deploy-timemachine.sh`: One-command script to build, push via SMB, and launch agent on `timemachine`.
-   - `deploy/deploy-q9650.sh`: Matching script for the second test rig (`q9650`).
-4. **Public Standalone Installer**:
-   - `deploy/install-agent.bat`: Clean batch script for general public users to install on their own XP rigs.
+### Objectives Achieved
+1. **Host Ed25519 Cryptographic Identity (`host/crates/xpdash-core/src/security.rs`)**:
+   - Implemented `HostIdentity` with Ed25519 keypair generation and persistent storage (`~/.config/xpdash/host_key.bin`).
+   - Implemented SHA-256 fingerprint generation (`SHA256:<64-hex>`) from the 32-byte Ed25519 public key.
+   - Implemented challenge signing and signature verification.
+2. **Zero-Configuration LAN Auto-Discovery**:
+   - `xpdash-server` periodically broadcasts UDP beacons on port 7022 containing server name, control port (7020), media port (7021), and the 32-byte Ed25519 public key.
+   - Server hosts an incoming `TcpListener` on port 7020 and gracefully handles incoming connections from discovered agents or outbound connections to explicit IPs.
+3. **Native XP Trust & Security Engine (`agent/src/discover.c`, `agent/src/sha256.c`)**:
+   - Embedded standalone, zero-dependency C SHA-256 implementation (`agent/src/sha256.c`, `agent/src/sha256.h`) keeping the PE binary 100% stock Windows XP compatible.
+   - Implemented configuration parser reading `agent.ini` (`[security] trusted_fingerprints`, `allow_all`, `prompt_user`).
+   - Implemented persistent trust storage in `trusted_servers.ini` and in-memory session caching for temporary authorizations and rejections.
+   - Implemented native Win32 interactive trust confirmation dialog (`MessageBoxA` with `MB_YESNOCANCEL` modal alert) for public mode.
+4. **Automatic Reconnection & Outbound Agent Connection (`agent/src/net.c`, `agent/src/main.c`)**:
+   - Implemented `net_connect_to_server()`: upon detecting a trusted beacon, the agent automatically initiates a TCP connection to the host server, sets media destination, transmits `HELLO_SYN`, and begins streaming.
+   - Maintained symmetrical support for incoming client connections on port 7020.
+5. **Packaging & Automated Remote Deployment**:
+   - `deploy/deploy-timemachine.sh`: Updated to deploy both `xpdash-agent.exe` and `agent.ini` to `C:\xpdash\` on `timemachine` (`10.0.10.113`) and launch on console session 0.
+   - `deploy/deploy-q9650.sh`: Added matching script for the secondary test rig `q9650` (`10.0.10.134`).
+   - `deploy/install-agent.bat`: Enhanced standalone public installer for Windows XP users with directory setup, default config generation, Windows Firewall rules (`netsh firewall`), and autostart registration.
+   - `deploy/uninstall-agent.bat`: Clean uninstallation script removing firewall rules, autostart entries, and agent binaries.
+   - `deploy/agent.ini`: Pre-seeded configuration template with lab server fingerprint.
+6. **End-to-End Live Verification on `timemachine`**:
+   - Deployed updated agent binary (119 KB) to `timemachine` (`10.0.10.113`).
+   - Started `xpdash-server` in pure zero-config mode with no IP argument.
+   - Verified beacon detection, fingerprint verification against `agent.ini`, automatic agent connection to `10.0.10.177:7020`, and immediate streaming of 48kHz audio and 800x600 video.
 
 ---
 

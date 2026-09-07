@@ -3,6 +3,9 @@
 use byteorder::{ByteOrder, LittleEndian};
 use std::time::Instant;
 
+pub mod security;
+pub use security::{compute_fingerprint, format_fingerprint, HostIdentity};
+
 pub const MAGIC: u8 = 0x58; // 'X'
 
 pub const TCP_CONTROL_PORT: u16 = 7020;

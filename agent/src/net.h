@@ -121,6 +121,12 @@ int net_init(void);
 /* Bind and listen for control connection */
 int net_listen_control(uint16_t port);
 
+/* Connect out to a discovered host server */
+int net_connect_to_server(const char *ip, uint16_t control_port, uint16_t media_port);
+
+/* Check if control session is currently connected */
+int net_is_connected(void);
+
 /* Set target client endpoint for UDP media stream */
 void net_set_media_destination(const char *ip, uint16_t port);
 

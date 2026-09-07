@@ -122,6 +122,48 @@ void net_set_media_destination(const char *ip, uint16_t port) {
     agent_log("net_set_media_destination: target %s:%d", ip, port);
 }
 
+int net_is_connected(void) {
+    return (g_client_tcp != INVALID_SOCKET);
+}
+
+int net_connect_to_server(const char *ip, uint16_t control_port, uint16_t media_port) {
+    if (g_client_tcp != INVALID_SOCKET) {
+        return 1; // Already connected
+    }
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        agent_log("net_connect_to_server: socket() failed");
+        return 0;
+    }
+
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = inet_addr(ip);
+    sin.sin_port = htons(control_port);
+
+    agent_log("net_connect_to_server: connecting to %s:%d...", ip, control_port);
+    if (connect(s, (struct sockaddr *)&sin, sizeof(sin)) != 0) {
+        agent_log("net_connect_to_server: connect failed (err=%d)", WSAGetLastError());
+        closesocket(s);
+        return 0;
+    }
+
+    u_long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
+
+    g_client_tcp = s;
+    net_set_media_destination(ip, media_port);
+    g_tcp_buf_len = 0;
+    g_is_authenticated = 1;
+    g_is_streaming = 1;
+
+    agent_log("net_connect_to_server: connected to %s:%d, streaming initialized", ip, control_port);
+    send_hello_syn();
+    return 1;
+}
+
 int net_is_streaming_active(void) {
     return (g_is_streaming && g_has_media_dest);
 }

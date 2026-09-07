@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# deploy-timemachine.sh — Build and push xpdash-agent.exe to timemachine (10.0.10.113)
+# deploy-q9650.sh — Build and push xpdash-agent.exe to q9650 rig (10.0.10.134)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-XP="${1:-10.0.10.113}"
+XP="${1:-10.0.10.134}"
 
 echo "=== Building xpdash-agent.exe ==="
 nix develop --command bash agent/build.sh
@@ -14,7 +14,7 @@ echo "=== Deploying to $XP (C:\xpdash\) ==="
 # Stop running agent if any
 nix run nixpkgs#netexec -- smb "$XP" -u Administrator -p '' -x 'taskkill /f /im xpdash-agent.exe 2>nul' >/dev/null || true
 
-# Copy agent to C:\xpdash\
+# Copy agent and agent.ini to C:\xpdash\
 smbclient "//$XP/C$" -U 'Administrator%' -m NT1 --option='client min protocol=NT1' -c "
 prompt OFF;
 mkdir \\xpdash;

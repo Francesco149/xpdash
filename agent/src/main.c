@@ -37,9 +37,16 @@ static void on_stream_state(int is_streaming, void *user_data) {
 
 static void on_server_discovered(const DiscoveredServer *server, void *user_data) {
     (void)user_data;
-    if (server && discover_is_trusted(server->fingerprint)) {
-        agent_log("Discovered server: %s, ports %d/%d", server->ip, server->control_port, server->media_port);
-        net_set_media_destination(server->ip, server->media_port);
+    if (!server) return;
+
+    if (!net_is_connected()) {
+        if (discover_is_trusted(server)) {
+            agent_log("Discovered trusted server: %s (%s), connecting to %d/%d",
+                      server->server_name, server->ip, server->control_port, server->media_port);
+            if (net_connect_to_server(server->ip, server->control_port, server->media_port)) {
+                video_force_keyframe();
+            }
+        }
     }
 }
 

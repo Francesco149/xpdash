@@ -20,9 +20,8 @@ int discover_init(discover_server_cb callback, void *user_data);
 /* Poll for incoming UDP beacons (non-blocking) */
 void discover_poll(void);
 
-/* Check if a server fingerprint is trusted in agent.ini or trusted_servers.ini */
-int discover_is_trusted(const uint8_t *fingerprint);
-
+/* Check if a server is trusted in agent.ini, trusted_servers.ini, or interactive prompt */
+int discover_is_trusted(const DiscoveredServer *server);
 /* Cleanup discovery socket */
 void discover_shutdown(void);
 
