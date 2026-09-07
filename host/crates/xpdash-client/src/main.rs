@@ -14,8 +14,8 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use xpdash_core::{
     AudioSliceHeader, MsgHelloSyn, MsgVideoResize, NetPacketHeader, PacketType, PtsClock,
-    TcpFrameHeader, VideoChunkHeader, OP_HELLO_SYN, OP_PING, OP_PONG, OP_STREAM_START,
-    OP_VIDEO_RESIZE, TCP_CONTROL_PORT, UDP_MEDIA_PORT,
+    TcpFrameHeader, VideoChunkHeader, MsgInputEvent, INPUT_TYPE_MOUSE_REL, OP_INPUT_EVENT,
+    OP_HELLO_SYN, OP_PING, OP_PONG, OP_STREAM_START, OP_VIDEO_RESIZE, TCP_CONTROL_PORT, UDP_MEDIA_PORT,
 };
 
 #[tokio::main]
@@ -71,11 +71,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = media_tx.send(()).await;
     });
 
+    let soak_duration_sec: u64 = std::env::var("XPDASH_SOAK_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let inject_mouse = std::env::var("XPDASH_INJECT_MOUSE").map(|v| v == "1").unwrap_or(false);
+
+    if soak_duration_sec > 0 {
+        log::info!("Soak test mode: running for {} seconds ({} minutes)", soak_duration_sec, soak_duration_sec / 60);
+    }
+    if inject_mouse {
+        log::info!("Side-to-side mouse injection enabled (50ms interval, alternating dx=+35/-35)");
+    }
+
+    let soak_start = Instant::now();
+    let mut mouse_interval = tokio::time::interval(Duration::from_millis(50));
+    let mut mouse_tick = 0u64;
+
     // Control message loop with periodic 1s RTT ping
     let mut ping_interval = tokio::time::interval(Duration::from_secs(1));
     let mut last_ping_sent: Option<Instant> = None;
     let mut buf = [0u8; 1024];
-
     loop {
         tokio::select! {
             _ = media_rx.recv() => {
@@ -86,6 +102,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_ping_sent = Some(Instant::now());
                 let ping_frame = [OP_PING, 0, 0, 0];
                 let _ = tcp_stream.write_all(&ping_frame).await;
+                if soak_duration_sec > 0 && soak_start.elapsed().as_secs() >= soak_duration_sec {
+                    log::info!("Soak test duration reached ({}s / {}m). Cleanly terminating stream.", soak_duration_sec, soak_duration_sec / 60);
+                    break;
+                }
+            }
+            _ = mouse_interval.tick(), if inject_mouse => {
+                mouse_tick += 1;
+                let dx: i16 = if (mouse_tick % 40) < 20 { 35 } else { -35 };
+                let ev = MsgInputEvent {
+                    event_type: INPUT_TYPE_MOUSE_REL,
+                    param1: 0,
+                    param2: dx,
+                    param3: 0,
+                    key_down: 0,
+                };
+                let mut ev_buf = [0u8; MsgInputEvent::SIZE];
+                if ev.encode(&mut ev_buf) {
+                    let mut frame_buf = [0u8; TcpFrameHeader::SIZE + MsgInputEvent::SIZE];
+                    let fhdr = TcpFrameHeader {
+                        opcode: OP_INPUT_EVENT,
+                        reserved: 0,
+                        payload_len: MsgInputEvent::SIZE as u16,
+                    };
+                    fhdr.encode(&mut frame_buf[..TcpFrameHeader::SIZE]);
+                    frame_buf[TcpFrameHeader::SIZE..].copy_from_slice(&ev_buf);
+                    let _ = tcp_stream.write_all(&frame_buf).await;
+                }
             }
             res = tcp_stream.read(&mut buf) => {
                 let n = match res {
@@ -270,8 +313,19 @@ async fn run_media_loop<P: Producer<Item = f32>>(
 
                             if vh.codec == 2 {
                                 let uncompressed_len = (entry.width as usize) * (entry.height as usize) * 4;
-                                if let Ok(_decompressed_pixels) = lz4_flex::decompress(&compressed, uncompressed_len) {
+                                if let Ok(decompressed_pixels) = lz4_flex::decompress(&compressed, uncompressed_len) {
                                     video_frames_rx += 1;
+                                    let _non_zero_count = decompressed_pixels.iter().filter(|&&b| b != 0).count();
+                                    if video_frames_rx == 1 {
+                                        log::info!("[Frame Content] Saving Frame #{} to /tmp/gta_live.ppm", vh.frame_index);
+                                        let mut ppm = format!("P6\n{} {}\n255\n", entry.width, entry.height).into_bytes();
+                                        for chunk in decompressed_pixels.chunks_exact(4) {
+                                            ppm.push(chunk[2]);
+                                            ppm.push(chunk[1]);
+                                            ppm.push(chunk[0]);
+                                        }
+                                        let _ = std::fs::write("/tmp/gta_live.ppm", ppm);
+                                    }
                                 }
                             } else {
                                 video_frames_rx += 1;

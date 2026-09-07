@@ -13,6 +13,11 @@ This document serves as the architectural master plan and session-by-session exe
 | **Session 3** | **Host Server & Native Cross-Platform Client** | **COMPLETED** | Rust workspace (`cpal` low-latency audio, `ringbuf`, UDP/TCP receiver, anti-desync clock sync, LZ4 decompression, live E2E streaming). |
 | **Session 4** | **Auto-Discovery, Security & Packaging** | **COMPLETED** | UDP discovery beacons, Ed25519 fingerprinting, interactive XP trust UI, `deploy.sh` and public `install-agent.bat`. |
 | **Session 5** | **End-to-End Integration, Soak Testing & Real EAX Games** | **COMPLETED** | Hardware EAX EMU10K2 DSP capture, GTA San Andreas 3D streaming, 1ms `timeGetTime` agent timer, adaptive `PtsClock` drift tracking, sub-3ms RTT soak test. |
+| **Session 6** | **Native GUI Framework & Machine Dashboard** | *Pending* | Rust `egui` + `wgpu` client UI, auto-discovery machine roster grid, live health badges, zero-copy texture streaming. |
+| **Session 7** | **Input Confinement & Modifier Routing Engine** | *Pending* | Relative mouse pointer lock (`Right-Ctrl` toggle), low-level keyboard hook / Wayland shortcut inhibitor, Win-Key and Alt+Tab capture toggles, PS/2 scancodes. |
+| **Session 8** | **In-Game HUD, Audio Controls & Retro CRT Shaders** | *Pending* | Slide-down in-game HUD overlay, real-time RTT/FPS diagnostics, audio volume/VU meters, CRT scanlines & integer scaling shaders. |
+| **Session 9** | **Remote Deployer Wizard & Standalone Packaging** | *Pending* | In-app SMB/WMI remote agent deployer dialog, standalone XP NSIS installer, portable Linux AppImage and Windows standalone client executable. |
+| **Session 10** | **Web Client Gateway & Browser Streaming** | *Pending* | WebSocket proxy gateway (`xpdash-web`), WebCodecs video decompressor, WebAudio 48kHz PCM output for browser gaming. |
 
 ---
 
@@ -139,3 +144,32 @@ This document serves as the architectural master plan and session-by-session exe
      - Video delivery: 64 frames received, 0 dropped (100% reliability).
      - Audio delivery: 11,984 slices received, 58 dropped (99.52% reliability).
      - Average Bitrate: 11.8 Mbps smooth streaming with zero buffer bloat.
+
+---
+
+## Future Sessions (Sessions 6 to 10): User-Facing Ecosystem & UI
+
+Detailed architectural specifications, interface designs, input confinement subsystems, and deployment mechanisms are documented in [UI_ROADMAP.md](UI_ROADMAP.md).
+
+### Session 6: Native GUI Framework & Machine Dashboard
+- Integrate `egui`, `egui-wgpu`, and `winit` into `xpdash-client`.
+- Build discovery machine roster grid displaying discovered rigs, real-time RTT latency badges, and screenshot thumbnails.
+- Implement hardware-accelerated zero-copy texture streaming surface with aspect-ratio preserving scaling.
+
+### Session 7: Input Confinement & Modifier Routing Engine
+- Implement relative pointer confinement (pointer lock) with visual state indicator and configurable release hotkey (default `Right-Ctrl`).
+- Implement low-level keyboard hook (Windows) and Wayland shortcut inhibitor / X11 grab (Linux) to selectively capture or release `Super/Win`, `Alt+Tab`, `Alt+F4`, and `Ctrl+Alt+Del`.
+- Implement hardware PS/2 Set 1 scancode translation table for legacy DirectInput 8/9 game compatibility.
+
+### Session 8: In-Game HUD, Audio Controls & Retro CRT Shaders
+- Implement slide-down in-game HUD overlay (hover top edge or `F10`) with live telemetry (FPS, RTT, jitter, loss).
+- Implement audio mixer controls (volume slider, mute toggle, channel balance, buffer size selector).
+- Implement GPU-accelerated CRT scanline and integer-scaling shaders.
+
+### Session 9: Remote Deployer Wizard & Standalone Packaging
+- Implement in-app One-Click Remote Deployer wizard over SMB/WMI.
+- Package zero-dependency standalone Windows XP setup installer (`xpdash-agent-setup.exe`).
+- Package portable Linux AppImage and standalone Windows `.exe` client.
+
+### Session 10: Web Client Gateway & Browser Streaming
+- Implement `xpdash-web` WebSocket bridge with WebCodecs video and WebAudio 48kHz output.
