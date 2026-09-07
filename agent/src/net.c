@@ -364,7 +364,7 @@ static void handle_control_frame(uint8_t opcode, const uint8_t *payload, uint16_
                         input_inject_mouse_abs((uint16_t)ev->param2, (uint16_t)ev->param3);
                         break;
                     case INPUT_TYPE_MOUSE_BTN:
-                        input_inject_mouse_btn(ev->param1);
+                        input_inject_mouse_btn(ev->param1, ev->key_down);
                         break;
                     case INPUT_TYPE_MOUSE_WHEEL:
                         input_inject_mouse_wheel((int16_t)ev->param1);
@@ -470,7 +470,7 @@ void net_poll_udp_input(void) {
                         input_inject_mouse_abs((uint16_t)ev->param2, (uint16_t)ev->param3);
                         break;
                     case INPUT_TYPE_MOUSE_BTN:
-                        input_inject_mouse_btn(ev->param1);
+                        input_inject_mouse_btn(ev->param1, ev->key_down);
                         break;
                     case INPUT_TYPE_MOUSE_WHEEL:
                         input_inject_mouse_wheel((int16_t)ev->param1);

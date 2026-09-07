@@ -185,17 +185,17 @@ impl InputHandler {
                             continue;
                         }
 
-                        let btn_flag: u16 = match button {
-                            PointerButton::Primary => 0x0001,   // Left
-                            PointerButton::Secondary => 0x0002, // Right
-                            PointerButton::Middle => 0x0004,    // Middle
+                        let btn_id: u16 = match button {
+                            PointerButton::Primary => 1,   // Left
+                            PointerButton::Secondary => 2, // Right
+                            PointerButton::Middle => 3,    // Middle
                             _ => 0,
                         };
 
-                        if btn_flag != 0 {
+                        if btn_id != 0 {
                             session.send_input(MsgInputEvent {
                                 event_type: INPUT_TYPE_MOUSE_BTN,
-                                param1: btn_flag,
+                                param1: btn_id,
                                 param2: 0,
                                 param3: 0,
                                 key_down: if pressed { 1 } else { 0 },

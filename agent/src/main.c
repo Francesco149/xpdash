@@ -33,6 +33,7 @@ static void on_stream_state(int is_streaming, void *user_data) {
     (void)user_data;
     agent_log("on_stream_state: streaming=%d", is_streaming);
     if (is_streaming) {
+        input_reset_buttons();
         video_force_keyframe();
         /* Attempt D3D9 hook injection when streaming starts.
            If a D3D9 game is running, this hooks Present() for

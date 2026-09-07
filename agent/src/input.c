@@ -40,12 +40,38 @@ void input_inject_mouse_abs(uint16_t x, uint16_t y) {
     SendInput(1, &inp, sizeof(INPUT));
 }
 
-void input_inject_mouse_btn(uint16_t btn_flags) {
+void input_reset_buttons(void) {
     INPUT inp;
     memset(&inp, 0, sizeof(inp));
     inp.type = INPUT_MOUSE;
-    inp.mi.dwFlags = btn_flags;
+    inp.mi.dwFlags = MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MIDDLEUP;
     SendInput(1, &inp, sizeof(INPUT));
+}
+
+void input_inject_mouse_btn(uint16_t button, int is_down) {
+    DWORD flags = 0;
+    switch (button) {
+        case 1: /* Primary / Left */
+            flags = is_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+            break;
+        case 2: /* Secondary / Right */
+            flags = is_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+            break;
+        case 3: /* Middle */
+        case 4:
+            flags = is_down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+            break;
+        default:
+            flags = button;
+            break;
+    }
+    if (flags) {
+        INPUT inp;
+        memset(&inp, 0, sizeof(inp));
+        inp.type = INPUT_MOUSE;
+        inp.mi.dwFlags = flags;
+        SendInput(1, &inp, sizeof(INPUT));
+    }
 }
 
 void input_inject_mouse_wheel(int16_t delta) {
