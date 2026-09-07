@@ -14,3 +14,6 @@ ringbuf.workspace = true
 cpal.workspace = true
 lz4_flex.workspace = true
 socket2.workspace = true
+egui.workspace = true
+eframe.workspace = true
+parking_lot = "0.12"

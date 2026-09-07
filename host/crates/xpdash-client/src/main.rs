@@ -1,4 +1,9 @@
-//! xpdash-client — Native low-latency audio/video client with cpal and anti-desync clock.
+//! xpdash-client — Native low-latency audio/video client with eframe GUI and anti-desync clock.
+
+mod app;
+mod audio;
+mod network;
+mod ui;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -13,22 +18,70 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use xpdash_core::{
-    AudioSliceHeader, MsgHelloSyn, MsgVideoResize, NetPacketHeader, PacketType, PtsClock,
-    TcpFrameHeader, VideoChunkHeader, MsgInputEvent, INPUT_TYPE_MOUSE_REL, OP_INPUT_EVENT,
-    OP_HELLO_SYN, OP_PING, OP_PONG, OP_STREAM_START, OP_VIDEO_RESIZE, TCP_CONTROL_PORT, UDP_MEDIA_PORT,
+    AudioSliceHeader, MsgHelloSyn, MsgInputEvent, MsgVideoResize, NetPacketHeader, PacketType,
+    PtsClock, TcpFrameHeader, VideoChunkHeader, INPUT_TYPE_MOUSE_REL, OP_HELLO_SYN,
+    OP_INPUT_EVENT, OP_PING, OP_PONG, OP_STREAM_START, OP_VIDEO_RESIZE, TCP_CONTROL_PORT,
+    UDP_MEDIA_PORT,
 };
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("=== xpdash-client initializing ===");
 
-    let agent_ip = std::env::args().nth(1).unwrap_or_else(|| "10.0.10.113".to_string());
+    let args: Vec<String> = std::env::args().collect();
+    let is_headless = args.iter().any(|a| a == "--headless")
+        || std::env::var("XPDASH_HEADLESS").map(|v| v == "1").unwrap_or(false)
+        || std::env::var("XPDASH_SOAK_SECONDS").is_ok();
+
+    if is_headless {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(run_headless_mode(args))
+    } else {
+        // Native GUI Mode with eframe
+        let target_arg = args.get(1).and_then(|a| {
+            if a.starts_with("--") {
+                None
+            } else {
+                Some(a.clone())
+            }
+        });
+
+        let native_options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_title("xpdash — Windows XP Remote Console")
+                .with_inner_size([1024.0, 768.0])
+                .with_min_inner_size([640.0, 480.0])
+                .with_active(true),
+            ..Default::default()
+        };
+
+        // Create multithreaded Tokio runtime for background discovery & streaming tasks
+        let _rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let _guard = _rt.enter();
+
+        log::info!("Launching eframe native GUI window...");
+        eframe::run_native(
+            "xpdash-client",
+            native_options,
+            Box::new(move |cc| Ok(Box::new(app::XpDashApp::new(cc, target_arg)))),
+        )?;
+
+        Ok(())
+    }
+}
+
+async fn run_headless_mode(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    log::info!("Starting in headless stream mode...");
+    let agent_ip = args
+        .iter()
+        .find(|a| !a.starts_with("--") && a.as_str() != args[0])
+        .cloned()
+        .unwrap_or_else(|| "10.0.10.113".to_string());
+
     log::info!("Connecting to Windows XP Agent: {}", agent_ip);
 
-    // Setup CPAL Audio Output
-    // 48 kHz stereo 16-bit = 96,000 samples/sec.
-    // 25ms buffer capacity = 2,400 samples
     let rb = HeapRb::<f32>::new(4800);
     let (mut audio_prod, audio_cons) = rb.split();
 
@@ -39,12 +92,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(stream)
         }
         Err(e) => {
-            log::warn!("Could not initialize cpal audio device ({}); running audio in headless mode.", e);
+            log::warn!("Could not initialize cpal audio device ({}); running audio headless.", e);
             None
         }
     };
 
-    // Connect to TCP Control Port 7020
     let agent_addr: SocketAddr = format!("{}:{}", agent_ip, TCP_CONTROL_PORT).parse()?;
     let mut tcp_stream = match TcpStream::connect(agent_addr).await {
         Ok(s) => {
@@ -57,12 +109,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Request stream start
     let start_msg = [OP_STREAM_START, 0, 0, 0];
     tcp_stream.write_all(&start_msg).await?;
     log::info!("Sent OP_STREAM_START to agent.");
 
-    // Spawn media receiver task on UDP 7021
     let (media_tx, mut media_rx) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
         if let Err(e) = run_media_loop(&mut audio_prod).await {
@@ -88,10 +138,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mouse_interval = tokio::time::interval(Duration::from_millis(50));
     let mut mouse_tick = 0u64;
 
-    // Control message loop with periodic 1s RTT ping
     let mut ping_interval = tokio::time::interval(Duration::from_secs(1));
     let mut last_ping_sent: Option<Instant> = None;
     let mut buf = [0u8; 1024];
+
     loop {
         tokio::select! {
             _ = media_rx.recv() => {
@@ -103,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ping_frame = [OP_PING, 0, 0, 0];
                 let _ = tcp_stream.write_all(&ping_frame).await;
                 if soak_duration_sec > 0 && soak_start.elapsed().as_secs() >= soak_duration_sec {
-                    log::info!("Soak test duration reached ({}s / {}m). Cleanly terminating stream.", soak_duration_sec, soak_duration_sec / 60);
+                    log::info!("Soak test duration reached ({}s). Cleanly terminating stream.", soak_duration_sec);
                     break;
                 }
             }
@@ -197,12 +247,10 @@ fn init_audio_output<C: Consumer<Item = f32> + Send + 'static>(
         .default_output_device()
         .ok_or_else(|| "No default audio output device found")?;
 
-    log::info!("Audio device: {}", device.name()?);
-
     let config = cpal::StreamConfig {
         channels: 2,
         sample_rate: cpal::SampleRate(48000),
-        buffer_size: cpal::BufferSize::Fixed(480), // 10ms buffer size
+        buffer_size: cpal::BufferSize::Fixed(480),
     };
 
     let stream = device.build_output_stream(
@@ -237,7 +285,6 @@ async fn run_media_loop<P: Producer<Item = f32>>(
     let _ = sock2.set_recv_buffer_size(8 * 1024 * 1024);
     std_sock.set_nonblocking(true)?;
     let socket = UdpSocket::from_std(std_sock)?;
-    log::info!("Media stream receiver listening on UDP port {} (8MB buffer).", UDP_MEDIA_PORT);
 
     let mut buf = [0u8; 2048];
     let mut audio_clock = PtsClock::new(25);
@@ -250,10 +297,7 @@ async fn run_media_loop<P: Producer<Item = f32>>(
     let mut total_jitter_abs: f64 = 0.0;
     let mut jitter_samples: u64 = 0;
     let mut bytes_in_window: u64 = 0;
-    let mut record_file = std::env::var("XPDASH_RECORD_AUDIO").ok().and_then(|p| {
-        log::info!("Recording raw audio stream to: {}", p);
-        std::fs::File::create(p).ok()
-    });
+
     loop {
         let (len, _src) = socket.recv_from(&mut buf).await?;
         if len < NetPacketHeader::SIZE {
@@ -269,7 +313,6 @@ async fn run_media_loop<P: Producer<Item = f32>>(
                         jitter_samples += 1;
                     }
 
-                    // Anti-desync check: drop if late
                     if !audio_clock.is_packet_acceptable(nh.pts_ms) {
                         audio_dropped += 1;
                         continue;
@@ -277,17 +320,12 @@ async fn run_media_loop<P: Producer<Item = f32>>(
 
                     if let Some((_ah, pcm_data)) = AudioSliceHeader::parse(payload) {
                         audio_packets_rx += 1;
-                        // Convert 16-bit LE PCM bytes to f32 samples (-1.0 to 1.0)
                         let mut i = 0;
                         while i + 2 <= pcm_data.len() {
                             let sample_i16 = i16::from_le_bytes([pcm_data[i], pcm_data[i + 1]]);
                             let sample_f32 = (sample_i16 as f32) / 32768.0;
                             let _ = audio_prod.try_push(sample_f32);
                             i += 2;
-                        }
-                        if let Some(ref mut f) = record_file {
-                            use std::io::Write;
-                            let _ = f.write_all(pcm_data);
                         }
                     }
                 }
@@ -303,7 +341,6 @@ async fn run_media_loop<P: Producer<Item = f32>>(
                         entry.received_chunks.insert(vh.chunk_index, chunk_data.to_vec());
 
                         if entry.received_chunks.len() == entry.total_chunks as usize {
-                            // Frame complete, reassemble and decompress
                             let mut compressed = Vec::new();
                             for c in 0..entry.total_chunks {
                                 if let Some(part) = entry.received_chunks.get(&c) {
@@ -313,19 +350,8 @@ async fn run_media_loop<P: Producer<Item = f32>>(
 
                             if vh.codec == 2 {
                                 let uncompressed_len = (entry.width as usize) * (entry.height as usize) * 4;
-                                if let Ok(decompressed_pixels) = lz4_flex::decompress(&compressed, uncompressed_len) {
+                                if let Ok(_decompressed) = lz4_flex::decompress(&compressed, uncompressed_len) {
                                     video_frames_rx += 1;
-                                    let _non_zero_count = decompressed_pixels.iter().filter(|&&b| b != 0).count();
-                                    if video_frames_rx == 1 {
-                                        log::info!("[Frame Content] Saving Frame #{} to /tmp/gta_live.ppm", vh.frame_index);
-                                        let mut ppm = format!("P6\n{} {}\n255\n", entry.width, entry.height).into_bytes();
-                                        for chunk in decompressed_pixels.chunks_exact(4) {
-                                            ppm.push(chunk[2]);
-                                            ppm.push(chunk[1]);
-                                            ppm.push(chunk[0]);
-                                        }
-                                        let _ = std::fs::write("/tmp/gta_live.ppm", ppm);
-                                    }
                                 }
                             } else {
                                 video_frames_rx += 1;
