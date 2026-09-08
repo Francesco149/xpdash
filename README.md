@@ -54,10 +54,17 @@ xpdash/
 │       ├── net.c/.h      # UDP/TCP network streaming engine
 │       └── discover.c/.h # UDP beacon listener and discovery
 ├── tools/
+│   ├── build-all.sh      # Master build script compiling all XP test tools
+│   ├── Makefile          # Top-level tools Makefile
+│   ├── README.md         # Comprehensive test suite documentation & verified matrix
+│   ├── test-gdi/         # Win32 GDI double-buffered 8/16/32bpp & palette test
+│   ├── test-ddraw/       # DirectDraw 7 exclusive fullscreen flip & windowed test
+│   ├── test-d3d8/        # Direct3D 8 rotating 3D lit cube & depth buffer test
+│   ├── test-d3d9/        # Direct3D 9 hook & BitBlt fallback test
+│   ├── test-opengl/      # Win32 WGL + OpenGL 1.1 double-buffered 3D scene test
+│   ├── test-modeswitch/  # Automated 11-mode display resolution & bpp matrix test
+│   ├── probe-video/      # Display caps & system DAC palette dump probe
 │   └── eax-test/         # Standalone EAX DirectSound3D/OpenAL hardware verification tool
-│       ├── build.sh
-│       ├── Makefile
-│       └── src/main.c
 ├── host/                 # Host Server & Client (Rust workspace)
 │   ├── Cargo.toml
 │   └── crates/
@@ -97,8 +104,14 @@ nix develop -c bash agent/build.sh
 nix develop -c cargo build --workspace
 ```
 
-### Building & Running the EAX Test App
+### Building the Windows XP Graphics & Audio Test Suite
 ```sh
-nix develop -c bash tools/eax-test/build.sh
-# -> outputs tools/eax-test/bin/eax-test.exe
+nix develop -c bash tools/build-all.sh
+# -> outputs all test executables into tools/bin/
 ```
+
+---
+
+## License
+
+Licensed under the [MIT License](LICENSE).
