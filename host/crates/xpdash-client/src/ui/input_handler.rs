@@ -33,7 +33,7 @@ impl InputHandler {
             mode: ConfinementMode::Unconfined,
             last_cursor_pos: None,
             show_hud: false,
-            sensitivity: 0.05,
+            sensitivity: 0.15,
             accum_x: 0.0,
             accum_y: 0.0,
             is_at_edge: false,
@@ -415,16 +415,21 @@ mod tests {
     #[test]
     fn test_mouse_sensitivity_subpixel_accumulation() {
         let mut handler = InputHandler::new();
-        assert_eq!(handler.sensitivity, 0.05);
+        assert_eq!(handler.sensitivity, 0.15);
 
-        // delta of 4.0 points with 0.05 sens = 0.20 -> send_dx = 0, remainder 0.20
-        handler.accum_x += 4.0 * handler.sensitivity;
-        // After 16 more points (total 20 points * 0.05 = 1.0): send_dx = 1, remainder 0.0
-        handler.accum_x += 16.0 * handler.sensitivity;
+        // delta of 2.0 points with 0.15 sens = 0.30 -> send_dx = 0, remainder 0.30
+        handler.accum_x += 2.0 * handler.sensitivity;
         let eps = if handler.accum_x >= 0.0 { 1e-4 } else { -1e-4 };
         let send_dx = (handler.accum_x + eps).trunc() as i16;
-        assert_eq!(send_dx, 1);
-        handler.accum_x -= send_dx as f32;
-        assert!(handler.accum_x.abs() < 1e-3);
+        assert_eq!(send_dx, 0);
+        assert!((handler.accum_x - 0.30).abs() < 1e-3);
+
+        // After 5 more points (total 7 points * 0.15 = 1.05): send_dx = 1, remainder 0.05
+        handler.accum_x += 5.0 * handler.sensitivity;
+        let eps2 = if handler.accum_x >= 0.0 { 1e-4 } else { -1e-4 };
+        let send_dx2 = (handler.accum_x + eps2).trunc() as i16;
+        assert_eq!(send_dx2, 1);
+        handler.accum_x -= send_dx2 as f32;
+        assert!((handler.accum_x - 0.05).abs() < 1e-3);
     }
 }

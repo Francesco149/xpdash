@@ -70,25 +70,12 @@ void input_inject_mouse_abs(uint16_t x, uint16_t y) {
     } else {
         /* 3D Gameplay mode: cursor is hidden by game!
            Do NOT call SetCursorPos which conflicts with GTA SA's camera re-centering!
-           Instead, convert coordinate delta into relative mouse movement with subpixel scaling. */
-        static float s_accum_dx = 0.0f;
-        static float s_accum_dy = 0.0f;
-
+           Pass unmodified 1:1 relative mouse movement. */
         if (s_prev_abs_x >= 0 && s_prev_abs_y >= 0) {
-            float raw_dx = (float)(px - s_prev_abs_x) * 0.25f;
-            float raw_dy = (float)(py - s_prev_abs_y) * 0.25f;
-
-            s_accum_dx += raw_dx;
-            s_accum_dy += raw_dy;
-
-            int send_dx = (int)s_accum_dx;
-            int send_dy = (int)s_accum_dy;
-
-            s_accum_dx -= (float)send_dx;
-            s_accum_dy -= (float)send_dy;
-
-            if (send_dx != 0 || send_dy != 0) {
-                input_inject_mouse_rel((int16_t)send_dx, (int16_t)send_dy);
+            int dx = px - s_prev_abs_x;
+            int dy = py - s_prev_abs_y;
+            if (dx != 0 || dy != 0) {
+                input_inject_mouse_rel((int16_t)dx, (int16_t)dy);
             }
         }
         s_prev_abs_x = px;
