@@ -93,6 +93,18 @@ impl InputHandler {
             self.last_applied_visible = Some(desired_visible);
         }
 
+        let events = ctx.input(|i| i.events.clone());
+
+        // Extract raw hardware mouse motion deltas (WM_INPUT / DeviceEvent::MouseMotion).
+        // On Windows with CursorGrab::Locked / Confined, ClipCursor traps pointer coordinates,
+        // making pointer.delta() zero; raw motion is delivered via Event::MouseMoved.
+        let mut raw_motion_delta = egui::Vec2::ZERO;
+        for event in &events {
+            if let Event::MouseMoved(vec) = event {
+                raw_motion_delta += *vec;
+            }
+        }
+
         if self.is_confined() {
             // Detect if cursor reached viewport edge (when compositor ignores pointer lock in niri/Wayland)
             let mut edge_dx = 0i16;
@@ -117,11 +129,15 @@ impl InputHandler {
                 self.is_at_edge = false;
             }
 
-            // Continuous relative hardware delta tracking with subpixel accumulation
-            let delta = ctx.input(|i| i.pointer.delta());
+            // Prefer raw hardware mouse motion (from Event::MouseMoved) when available.
+            // Fall back to pointer.delta() on platforms that only emit pointer events.
+            let delta = if raw_motion_delta != egui::Vec2::ZERO {
+                raw_motion_delta
+            } else {
+                ctx.input(|i| i.pointer.delta())
+            };
             self.accum_x += delta.x * self.sensitivity;
             self.accum_y += delta.y * self.sensitivity;
-
             let eps_x = if self.accum_x >= 0.0 { 1e-4 } else { -1e-4 };
             let eps_y = if self.accum_y >= 0.0 { 1e-4 } else { -1e-4 };
             let mut send_dx = (self.accum_x + eps_x).trunc() as i16;
@@ -174,9 +190,10 @@ impl InputHandler {
             }
         }
 
-        let events = ctx.input(|i| i.events.clone());
         for event in events {
             match event {
+                // Raw mouse motion processed above
+                Event::MouseMoved(_) => {}
                 // Key press / release
                 Event::Key { key, pressed, repeat, modifiers: _, .. } => {
                     // F10 toggles in-game HUD overlay
@@ -218,9 +235,8 @@ impl InputHandler {
                 Event::PointerMoved(_) => {}
                 // Mouse buttons
                 Event::PointerButton { pos, button, pressed, .. } => {
-                    if viewport_rect.contains(pos) {
+                    if self.is_confined() || viewport_rect.contains(pos) {
                         if !self.is_confined() {
-                            // Ensure cursor is positioned at click location before button event
                             let rel_x = (pos.x - viewport_rect.left()) / viewport_rect.width();
                             let rel_y = (pos.y - viewport_rect.top()) / viewport_rect.height();
                             let abs_x = (rel_x.clamp(0.0, 1.0) * 65535.0).round() as u16;
@@ -431,5 +447,16 @@ mod tests {
         assert_eq!(send_dx2, 1);
         handler.accum_x -= send_dx2 as f32;
         assert!((handler.accum_x - 0.05).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_event_mouse_moved_raw_delta() {
+        let event = Event::MouseMoved(egui::Vec2::new(10.0, -5.0));
+        if let Event::MouseMoved(vec) = event {
+            assert_eq!(vec.x, 10.0);
+            assert_eq!(vec.y, -5.0);
+        } else {
+            panic!("Expected Event::MouseMoved");
+        }
     }
 }
