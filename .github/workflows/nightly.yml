@@ -129,13 +129,16 @@ jobs:
 
           gh release delete nightly --yes 2>/dev/null || true
 
-          gh release create nightly final-dist/* \
-            --title "xpdash Nightly ($COMMIT_DATE - $SHORT_SHA)" \
-            --notes "Automated nightly release built from commit [${SHORT_SHA}](https://github.com/${{ github.repository }}/commit/${{ github.sha }}).
+          cat << 'EOF' > release_notes.md
+          Automated nightly release built from latest commit.
 
           ### Standalone Release Bundles:
-          - **\`xpdash-linux-x86_64.tar.gz\`**: Linux 64-bit client (\`xpdash-client\`) & server (\`xpdash-server\`) with launcher scripts
-          - **\`xpdash-client-windows-x86_64.zip\`**: Windows 10/11 64-bit client with OBS virtual capture card mode (\`run-obs.bat\`)
-          - **\`xpdash-agent-winxp.zip\`**: Windows XP agent (\`xpdash-agent.exe\`), hook DLLs, auto-installers, and complete graphics/audio test suite" \
-            --prerelease \
-            --clobber
+          - `xpdash-linux-x86_64.tar.gz`: Linux 64-bit client (xpdash-client) & server (xpdash-server) with launcher scripts
+          - `xpdash-client-windows-x86_64.zip`: Windows 10/11 64-bit client with OBS virtual capture card mode (run-obs.bat)
+          - `xpdash-agent-winxp.zip`: Windows XP agent (xpdash-agent.exe), hook DLLs, auto-installers, and complete graphics/audio test suite
+          EOF
+
+          gh release create nightly final-dist/* \
+            --title "xpdash Nightly ($COMMIT_DATE - $SHORT_SHA)" \
+            --notes-file release_notes.md \
+            --prerelease
