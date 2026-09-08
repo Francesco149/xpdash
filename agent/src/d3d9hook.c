@@ -121,6 +121,16 @@ static DWORD find_d3d9_process(void) {
     do {
         if (pe.th32ProcessID == my_pid) continue;
         if (pe.th32ProcessID <= 4) continue;  /* system processes */
+        /* Verify process is still alive before considering it */
+        HANDLE hCheck = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+        if (!hCheck) continue;
+        DWORD pcode = 0;
+        if (!GetExitCodeProcess(hCheck, &pcode) || pcode != STILL_ACTIVE) {
+            CloseHandle(hCheck);
+            continue;
+        }
+        CloseHandle(hCheck);
+
         /* Direct match for known D3D9 game executables without needing module snapshot */
         if (lstrcmpiA(pe.szExeFile, "gta_sa.exe") == 0) {
             found_pid = pe.th32ProcessID;
@@ -321,22 +331,28 @@ int d3d9hook_is_active(void) {
     if (!g_hook_cs_inited) return 0;
     EnterCriticalSection(&g_hook_cs);
 
-    /* Always check if the injected process is still alive FIRST */
-    if (g_injected_proc) {
-        DWORD code = 0;
-        if (GetExitCodeProcess(g_injected_proc, &code) && code != STILL_ACTIVE) {
-            agent_log("d3d9hook: injected process PID %lu exited (code=%lu)",
-                      (unsigned long)g_injected_pid, (unsigned long)code);
+    /* If no process is currently injected, hook cannot be active! */
+    if (!g_injected_proc) {
+        if (g_shm_ptr) {
             close_shm_locked();
-            CloseHandle(g_injected_proc);
-            g_injected_proc = NULL;
-            g_injected_pid = 0;
-            g_remote_dll_base = NULL;
-            LeaveCriticalSection(&g_hook_cs);
-            return 0;
         }
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
     }
 
+    /* Always check if the injected process is still alive FIRST */
+    DWORD code = 0;
+    if (GetExitCodeProcess(g_injected_proc, &code) && code != STILL_ACTIVE) {
+        agent_log("d3d9hook: injected process PID %lu exited (code=%lu)",
+                  (unsigned long)g_injected_pid, (unsigned long)code);
+        close_shm_locked();
+        CloseHandle(g_injected_proc);
+        g_injected_proc = NULL;
+        g_injected_pid = 0;
+        g_remote_dll_base = NULL;
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
     /* Try to open SHM if not already open */
     if (!g_shm_ptr) {
         if (!open_shm_locked()) {
