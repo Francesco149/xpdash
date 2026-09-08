@@ -107,6 +107,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     net_listen_control(NET_TCP_CONTROL_PORT);
     discover_init(on_server_discovered, NULL);
     d3d9hook_init();
+    input_init();
     audio_init(on_audio_frame, NULL);
     audio_start();
     video_init(on_video_frame, NULL);
@@ -143,6 +144,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     agent_log("Exiting main loop, shutting down subsystems");
     d3d9hook_shutdown();
+    input_shutdown();
     video_shutdown();
     audio_shutdown();
     discover_shutdown();

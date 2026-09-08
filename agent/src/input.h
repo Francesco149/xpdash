@@ -4,6 +4,10 @@
 #include <windows.h>
 #include <stdint.h>
 
+/* Initialize input subsystem (opens or loads kernel input driver) */
+int input_init(void);
+void input_shutdown(void);
+
 /* Inject a keyboard event using DirectX hardware scancode */
 void input_inject_key(uint16_t scancode, int is_down, int is_extended);
 
