@@ -100,14 +100,42 @@ allow_all=0
 
 ---
 
-## Multi-Monitor Notice
+## Known Limitations & Workarounds
 
-**Multi-monitor display configurations on Windows XP are currently not supported.**
+### 1. Hardware Video Overlays (e.g. GTA San Andreas Intro Logos)
 
-The agent captures the primary monitor display context (`GetDC(NULL)` / primary DirectDraw surface). If you have multiple monitors connected to your Windows XP rig, the primary monitor will be streamed.
+**Observed Symptom**: When launching certain retro games (e.g. *Grand Theft Auto: San Andreas*), the initial publisher splash videos (`movies\Logo.mpg` and `movies\GTAtitles.mpg`) appear as a solid black screen on the client. As soon as the intro video ends (or is skipped) and the game reaches the 3D main menu, the stream appears immediately at full 60 FPS.
 
-*Do you have a genuine multi-monitor retro gaming or productivity use case on real Windows XP hardware?* We would love to hear about it! Please feel free to open a GitHub Issue or submit a Pull Request describing your setup and requirements.
+**Technical Root Cause**:
+- On Windows XP, pre-rendered MPEG-1/2 videos played via DirectShow or the RenderWare `rwmpeg` plugin render **before** the game initializes its Direct3D 9 device.
+- DirectShow decodes the video directly into a dedicated **Hardware YUV Overlay Surface** on the GPU. On the Windows desktop framebuffer (VRAM), the player paints only the GPU's hardware overlay color key (e.g. `RGB(16, 0, 16)` on NVIDIA graphics cards).
+- The physical monitor displays the video because the GPU's display controller / DAC replaces the `RGB(16, 0, 16)` color key with pixels from the overlay surface during hardware scanout to the physical monitor.
+- Desktop screen capture tools (`BitBlt`, `PrintScreen`, DIBSection) capture the desktop framebuffer in VRAM, which contains only the `RGB(16, 0, 16)` color key, appearing as black on the client.
+- *Note*: **All in-game story cutscenes in GTA San Andreas are 100% in-engine 3D rendered via Direct3D 9** and are streamed at full 60 FPS with zero flicker. The limitation applies strictly to standalone pre-rendered MPEG splash files. In contrast, games like *Lords of the Realm II* (which decode Bink/Smacker video in CPU software directly into standard GDI surfaces without an overlay plane) stream video without issue.
 
+**Workarounds & How to Disable Hardware Overlays on Windows XP**:
+If you wish to view pre-rendered MPEG videos through the stream, you can force Windows XP to render them onto standard desktop surfaces using one of the following methods:
+
+1. **Option A (Skip Intro Logos — Recommended)**:
+   - Press **`Space`**, **`Enter`**, or **`Esc`** at launch to skip the publisher intro logos and jump straight to the 3D main menu.
+   - Alternatively, rename or delete `movies\Logo.mpg` and `movies\GTAtitles.mpg` in your game directory (`C:\Program Files\Rockstar Games\GTA San Andreas\movies`) to permanently boot straight to the main menu instantly.
+2. **Option B (Disable Overlays in Windows Media Player / DirectShow)**:
+   - On the Windows XP host machine, open **Windows Media Player**.
+   - Navigate to **`Tools`** $\to$ **`Options`** $\to$ **`Performance`** tab.
+   - Click the **`Advanced...`** button under *Video acceleration*.
+   - Under *Video acceleration settings*, **uncheck "Use overlays"**.
+   - Under *Digital Video*, **check "Use high quality mode"** (forces VMR-7 / VMR-9 software blitting).
+   - Click **OK** $\to$ **Apply**. DirectShow will now composite video frames directly onto standard window surfaces, allowing `xpdash` to capture them.
+3. **Option C (DirectX Display Troubleshooter / Registry)**:
+   - In Windows XP, open **`Display Properties`** $\to$ **`Settings`** $\to$ **`Advanced`** $\to$ **`Troubleshoot`**.
+   - Reduce the **Hardware acceleration** slider by one notch (disables cursor and advanced overlay drawing accelerations, forcing drivers to blit video frames to the primary surface).
+   - Alternatively, add `DisableOverlay=1` as a `DWORD` under `HKLM\SOFTWARE\Microsoft\DirectDraw`.
+
+### 2. Multi-Monitor Setups
+
+**Multi-monitor display configurations on Windows XP are currently not supported.** The agent captures the primary monitor display context (`GetDC(NULL)`). If multiple monitors are connected, only the primary monitor is captured.
+
+*Do you have a genuine retro multi-monitor gaming or productivity use case on real Windows XP hardware?* We would love to hear about it! Please feel free to open a GitHub Issue or submit a Pull Request describing your setup and requirements.
 ---
 
 ## Verified Hardware Matrix

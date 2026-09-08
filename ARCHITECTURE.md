@@ -71,11 +71,14 @@ If `"What U Hear"` is not selected, the agent programmatically activates it via 
 ## 3. Video Pipeline & Dynamic Resolution Adaptation
 
 ### 3.1 Framebuffer Capture
-1. **GDI DIBSection Capture**:
+1. **GDI DIBSection Capture (Desktop & 2D)**:
    - `CreateCompatibleDC(NULL)` + `CreateDIBSection()` with a shared memory buffer.
-   - `BitBlt()` captures the desktop surface at up to 60 FPS.
-   - Zero-copy access to raw 32-bit BGRA pixel data.
-2. **Dirty-Tile Detection**:
+   - `BitBlt()` with `SRCCOPY | CAPTUREBLT` (0x40CC0020) captures the desktop surface at up to 60 FPS, including `WS_EX_LAYERED` transparent windows (Rainmeter widgets, alpha-blended overlays).
+   - Zero-copy access to raw 32-bit BGRX pixel data for TurboJPEG encoding.
+   - *Hardware Video Overlay limitation*: Pre-rendered MPEG videos decoded via legacy DirectShow hardware overlays render directly to an offscreen YUV overlay plane on the GPU while painting the desktop window with the GPU's overlay color key (`RGB(16, 0, 16)`). Desktop captures see only this color key unless hardware overlays are disabled (e.g. in Windows Media Player options or DirectX troubleshooter), prompting DirectShow to use VMR-7/9 software blitting. In-game 3D cutscenes are rendered via Direct3D 9 and captured via the D3D9 hook with zero issues.
+2. **Direct3D 9 Backbuffer Hook (3D Gaming)**:
+   - Injected hook DLL intercepts `IDirect3DDevice9::Present()` and reads the backbuffer directly via `GetRenderTargetData` to shared memory, completely eliminating mid-render tearing and flicker.
+3. **Dirty-Tile Detection**:
    - The desktop is subdivided into 64×64 pixel tiles.
    - A fast 64-bit hash or delta comparison flags changed tiles.
    - For desktop productivity, only modified tiles are compressed and transmitted.
