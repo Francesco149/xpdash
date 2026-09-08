@@ -283,24 +283,36 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
 static void d3d9hook_try_rehook(void) {
     if (!g_injected_proc || !g_remote_dll_base) return;
 
-    HMODULE hLocal = LoadLibraryA("C:\\xpdash\\xpdash-hook9.dll");
-    if (!hLocal) hLocal = LoadLibraryA("C:\\xpdash\\xpdash-hook.dll");
-    if (!hLocal) return;
+    DWORD proc_code = 0;
+    if (GetExitCodeProcess(g_injected_proc, &proc_code) && proc_code != STILL_ACTIVE) {
+        return;
+    }
 
-    FARPROC pFn = GetProcAddress(hLocal, "install_d3d9_hooks");
-    if (pFn) {
-        uintptr_t offset = (uintptr_t)pFn - (uintptr_t)hLocal;
-        LPTHREAD_START_ROUTINE pRemote = (LPTHREAD_START_ROUTINE)((uintptr_t)g_remote_dll_base + offset);
+    static uintptr_t s_rehook_offset = 0;
+    if (s_rehook_offset == 0) {
+        /* Load purely as a data/export image without executing DllMain */
+        HMODULE hMod = LoadLibraryExA("C:\\xpdash\\xpdash-hook9.dll", NULL, DONT_RESOLVE_DLL_REFERENCES);
+        if (!hMod) hMod = LoadLibraryExA("C:\\xpdash\\xpdash-hook.dll", NULL, DONT_RESOLVE_DLL_REFERENCES);
+        if (hMod) {
+            FARPROC pFn = GetProcAddress(hMod, "install_d3d9_hooks");
+            if (pFn) {
+                s_rehook_offset = (uintptr_t)pFn - (uintptr_t)hMod;
+            }
+            FreeLibrary(hMod);
+        }
+    }
+
+    if (s_rehook_offset != 0) {
+        LPTHREAD_START_ROUTINE pRemote = (LPTHREAD_START_ROUTINE)((uintptr_t)g_remote_dll_base + s_rehook_offset);
         HANDLE hThread = CreateRemoteThread(g_injected_proc, NULL, 0, pRemote, NULL, 0, NULL);
         if (hThread) {
             WaitForSingleObject(hThread, 1500);
-            DWORD code = 0;
-            GetExitCodeThread(hThread, &code);
+            DWORD exit_code = 0;
+            GetExitCodeThread(hThread, &exit_code);
             CloseHandle(hThread);
-            agent_log("d3d9hook: remote install_d3d9_hooks returned %lu", (unsigned long)code);
+            agent_log("d3d9hook: remote install_d3d9_hooks returned %lu", (unsigned long)exit_code);
         }
     }
-    FreeLibrary(hLocal);
 }
 
 /* ─── Frame Reading ───────────────────────────────────────────────────── */

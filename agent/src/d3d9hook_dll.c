@@ -435,10 +435,15 @@ static int install_hooks(void) {
     memset(&pp, 0, sizeof(pp));
     pp.Windowed = TRUE;
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.BackBufferFormat = D3DFMT_UNKNOWN;
     pp.BackBufferCount = 1;
     pp.hDeviceWindow = hwnd;
 
+    D3DDISPLAYMODE d3ddm;
+    if (SUCCEEDED(d3d9->lpVtbl->GetAdapterDisplayMode(d3d9, D3DADAPTER_DEFAULT, &d3ddm))) {
+        pp.BackBufferFormat = d3ddm.Format;
+    } else {
+        pp.BackBufferFormat = D3DFMT_A8R8G8B8;
+    }
     IDirect3DDevice9 *dev = NULL;
     HRESULT hr = d3d9->lpVtbl->CreateDevice(
         d3d9, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
@@ -502,7 +507,7 @@ static void remove_hooks(void) {
 /* ─── DLL Entry Point ─────────────────────────────────────────────────── */
 
 static HANDLE g_init_thread = NULL;
-
+static volatile int g_stop_init_thread = 0;
 __declspec(dllexport) int install_d3d9_hooks(void) {
     if (g_initialized && g_hooked_vtable) return 1;
     if (install_hooks()) {
@@ -521,8 +526,9 @@ static DWORD WINAPI hook_init_thread(LPVOID param) {
 
     /* Retry install_hooks() periodically until the game initializes its D3D9 device.
        Games take between 1 to 15 seconds to create their device after launch. */
-    for (int retry = 0; retry < 150; retry++) {
+    for (int retry = 0; retry < 150 && !g_stop_init_thread; retry++) {
         Sleep(200);
+        if (g_stop_init_thread) break;
         if (install_hooks()) {
             HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
             if (hdr) hdr->hook_active = 1;
@@ -541,8 +547,16 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpReserved) {
     (void)lpReserved;
 
     switch (fdwReason) {
-    case DLL_PROCESS_ATTACH:
+    case DLL_PROCESS_ATTACH: {
         DisableThreadLibraryCalls(hInstDLL);
+
+        char proc_name[MAX_PATH];
+        GetModuleFileNameA(NULL, proc_name, sizeof(proc_name));
+        if (strstr(proc_name, "xpdash-agent.exe") || strstr(proc_name, "xpdash-agent")) {
+            /* Never initialize hook or threads if loaded inside xpdash-agent */
+            return TRUE;
+        }
+
         InitializeCriticalSection(&g_cs);
 
         if (!shm_init()) return FALSE;
@@ -550,17 +564,26 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpReserved) {
         /* Defer hook installation — DllMain cannot call LoadLibrary,
            create COM objects, or do anything that acquires the loader lock.
            We spawn a thread that will install hooks after DllMain returns. */
+        g_stop_init_thread = 0;
         g_init_thread = CreateThread(NULL, 0, hook_init_thread, NULL, 0, NULL);
         if (!g_init_thread) {
             shm_shutdown();
             return FALSE;
         }
         break;
+    }
 
-    case DLL_PROCESS_DETACH:
+    case DLL_PROCESS_DETACH: {
+        char proc_name[MAX_PATH];
+        GetModuleFileNameA(NULL, proc_name, sizeof(proc_name));
+        if (strstr(proc_name, "xpdash-agent.exe") || strstr(proc_name, "xpdash-agent")) {
+            return TRUE;
+        }
+
+        g_stop_init_thread = 1;
         if (g_init_thread) {
             /* Wait briefly for init thread to finish */
-            WaitForSingleObject(g_init_thread, 2000);
+            WaitForSingleObject(g_init_thread, 500);
             CloseHandle(g_init_thread);
             g_init_thread = NULL;
         }
@@ -573,6 +596,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpReserved) {
         DeleteCriticalSection(&g_cs);
         break;
     }
-
+    }
     return TRUE;
 }
