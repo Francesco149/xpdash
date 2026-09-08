@@ -22,6 +22,10 @@ void input_inject_key(uint16_t scancode, int is_down, int is_extended) {
     INPUT inp;
     memset(&inp, 0, sizeof(inp));
     inp.type = INPUT_KEYBOARD;
+    if ((scancode & 0xFF00) == 0xE000 || scancode > 0xFF) {
+        is_extended = 1;
+        scancode &= 0xFF;
+    }
     inp.ki.wScan = scancode;
     inp.ki.dwFlags = KEYEVENTF_SCANCODE;
     if (!is_down) inp.ki.dwFlags |= KEYEVENTF_KEYUP;

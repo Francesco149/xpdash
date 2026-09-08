@@ -29,6 +29,7 @@ if errorlevel 1 (
     echo.
     pause
     exit /b 1
+)
 
 if exist "xpdash-hook.dll" copy /Y xpdash-hook.dll "%TARGET_DIR%\xpdash-hook.dll" >nul
 if exist "xpdash-hook9.dll" copy /Y xpdash-hook9.dll "%TARGET_DIR%\xpdash-hook9.dll" >nul

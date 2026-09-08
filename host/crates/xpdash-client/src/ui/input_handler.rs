@@ -25,6 +25,8 @@ pub struct InputHandler {
     pub grab_mode: egui::CursorGrab,
     pub last_applied_grab: Option<egui::CursorGrab>,
     pub last_applied_visible: Option<bool>,
+    pub last_modifiers: egui::Modifiers,
+    pub last_super_down: bool,
 }
 
 impl InputHandler {
@@ -33,13 +35,15 @@ impl InputHandler {
             mode: ConfinementMode::Unconfined,
             last_cursor_pos: None,
             show_hud: false,
-            sensitivity: 0.15,
+            sensitivity: 1.0,
             accum_x: 0.0,
             accum_y: 0.0,
             is_at_edge: false,
             grab_mode: egui::CursorGrab::Locked,
             last_applied_grab: None,
             last_applied_visible: None,
+            last_modifiers: egui::Modifiers::default(),
+            last_super_down: false,
         }
     }
 
@@ -56,7 +60,20 @@ impl InputHandler {
         self.accum_x = 0.0;
         self.accum_y = 0.0;
         self.is_at_edge = false;
+        if self.mode == ConfinementMode::Unconfined {
+            self.last_super_down = false;
+            self.last_modifiers = egui::Modifiers::default();
+        }
     }
+
+    pub fn toggle_confinement_with_release(&mut self, session: &ClientSession) {
+        let was_confined = self.is_confined();
+        self.toggle_confinement();
+        if was_confined {
+            self.release_all_modifiers(session);
+        }
+    }
+
     pub fn set_confined(&mut self, confined: bool) {
         self.mode = if confined {
             ConfinementMode::Confined
@@ -67,6 +84,60 @@ impl InputHandler {
         self.accum_x = 0.0;
         self.accum_y = 0.0;
         self.is_at_edge = false;
+        if !confined {
+            self.last_super_down = false;
+            self.last_modifiers = egui::Modifiers::default();
+        }
+    }
+
+    pub fn set_confined_with_release(&mut self, confined: bool, session: &ClientSession) {
+        let was_confined = self.is_confined();
+        self.set_confined(confined);
+        if was_confined && !confined {
+            self.release_all_modifiers(session);
+        }
+    }
+
+    /// Release all active modifier keys (Super, Shift, Ctrl, Alt) on the guest
+    pub fn release_all_modifiers(&mut self, session: &ClientSession) {
+        if self.last_super_down {
+            self.last_super_down = false;
+            session.send_input(MsgInputEvent {
+                event_type: INPUT_TYPE_KEY,
+                param1: 0xE05B, // Left Windows / Super Key
+                param2: 0,
+                param3: 0,
+                key_down: 0,
+            });
+        }
+        if self.last_modifiers.shift {
+            session.send_input(MsgInputEvent {
+                event_type: INPUT_TYPE_KEY,
+                param1: 0x2A, // Left Shift
+                param2: 0,
+                param3: 0,
+                key_down: 0,
+            });
+        }
+        if self.last_modifiers.ctrl {
+            session.send_input(MsgInputEvent {
+                event_type: INPUT_TYPE_KEY,
+                param1: 0x1D, // Left Ctrl
+                param2: 0,
+                param3: 0,
+                key_down: 0,
+            });
+        }
+        if self.last_modifiers.alt {
+            session.send_input(MsgInputEvent {
+                event_type: INPUT_TYPE_KEY,
+                param1: 0x38, // Left Alt
+                param2: 0,
+                param3: 0,
+                key_down: 0,
+            });
+        }
+        self.last_modifiers = egui::Modifiers::default();
     }
     /// Process egui input events and send corresponding network input messages
     pub fn handle_events(
@@ -189,6 +260,59 @@ impl InputHandler {
                 }
             }
         }
+        // Special Windows & modifier keys handling during confinement
+        if self.is_confined() {
+            // 1. Windows / Super Key capture
+            let super_down = is_super_key_down(ctx);
+            if super_down != self.last_super_down {
+                self.last_super_down = super_down;
+                session.send_input(MsgInputEvent {
+                    event_type: INPUT_TYPE_KEY,
+                    param1: 0xE05B, // Left Windows Key (PS/2 Set 1)
+                    param2: 0,
+                    param3: 0,
+                    key_down: if super_down { 1 } else { 0 },
+                });
+            }
+
+            // 2. Modifier keys: Shift, Ctrl, Alt
+            let current_modifiers = ctx.input(|i| i.modifiers);
+            if current_modifiers.shift != self.last_modifiers.shift {
+                session.send_input(MsgInputEvent {
+                    event_type: INPUT_TYPE_KEY,
+                    param1: 0x2A, // Left Shift
+                    param2: 0,
+                    param3: 0,
+                    key_down: if current_modifiers.shift { 1 } else { 0 },
+                });
+            }
+            if current_modifiers.ctrl != self.last_modifiers.ctrl {
+                session.send_input(MsgInputEvent {
+                    event_type: INPUT_TYPE_KEY,
+                    param1: 0x1D, // Left Ctrl
+                    param2: 0,
+                    param3: 0,
+                    key_down: if current_modifiers.ctrl { 1 } else { 0 },
+                });
+            }
+            if current_modifiers.alt != self.last_modifiers.alt {
+                session.send_input(MsgInputEvent {
+                    event_type: INPUT_TYPE_KEY,
+                    param1: 0x38, // Left Alt
+                    param2: 0,
+                    param3: 0,
+                    key_down: if current_modifiers.alt { 1 } else { 0 },
+                });
+            }
+            self.last_modifiers = current_modifiers;
+        } else if self.last_super_down
+            || self.last_modifiers.shift
+            || self.last_modifiers.ctrl
+            || self.last_modifiers.alt
+        {
+            self.release_all_modifiers(session);
+        }
+
 
         for event in events {
             match event {
@@ -202,17 +326,20 @@ impl InputHandler {
                         continue;
                     }
 
-                    // F12 toggles pointer confinement; Escape releases it
-                    if key == Key::F12 && pressed && !repeat {
-                        self.toggle_confinement();
+                    // F12 toggles pointer confinement; Escape releases it — LOCKOUT PROTECTION:
+                    // F12 is the dedicated undo key and is NEVER captured or forwarded to guest!
+                    if key == Key::F12 {
+                        if pressed && !repeat {
+                            self.toggle_confinement_with_release(session);
+                        }
                         continue;
                     }
                     if key == Key::Escape && pressed && self.is_confined() {
-                        self.set_confined(false);
+                        self.set_confined_with_release(false, session);
                         continue;
                     }
 
-                    // If modifiers indicate Ctrl or specific key
+                    // F11 toggles Fullscreen
                     if key == Key::F11 && pressed && !repeat {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
                             !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
@@ -252,7 +379,7 @@ impl InputHandler {
 
                         // Middle click toggles pointer confinement
                         if button == PointerButton::Middle && pressed {
-                            self.toggle_confinement();
+                            self.toggle_confinement_with_release(session);
                             continue;
                         }
 
@@ -375,10 +502,129 @@ pub fn key_to_ps2_scancode(key: Key) -> Option<u16> {
         Key::F9 => Some(0x43),
         Key::F10 => Some(0x44),
         Key::F11 => Some(0x57),
-        Key::F12 => Some(0x58),
+        Key::F12 => None, // Reserved as dedicated confinement toggle/undo key (lockout protection)
 
+        // Navigation & editing keys
+        Key::Insert => Some(0xE052),
+        Key::Delete => Some(0xE053),
+        Key::Home => Some(0xE047),
+        Key::End => Some(0xE04F),
+        Key::PageUp => Some(0xE049),
+        Key::PageDown => Some(0xE051),
+
+        // Punctuation & symbols
+        Key::Colon | Key::Semicolon => Some(0x27),
+        Key::Comma => Some(0x33),
+        Key::Period => Some(0x34),
+        Key::Slash => Some(0x35),
+        Key::Backslash | Key::Pipe => Some(0x2B),
+        Key::OpenBracket | Key::OpenCurlyBracket => Some(0x1A),
+        Key::CloseBracket | Key::CloseCurlyBracket => Some(0x1B),
+        Key::Backtick => Some(0x29),
+        Key::Minus => Some(0x0C),
+        Key::Equals | Key::Plus => Some(0x0D),
+        Key::Quote => Some(0x28),
         _ => None,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_super_key_linux() -> bool {
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
+    use std::path::PathBuf;
+    use std::sync::LazyLock;
+
+    const KEY_LEFTMETA: usize = 125;
+    const KEY_RIGHTMETA: usize = 126;
+    const EVIOCGKEY_64: libc::c_ulong = 0x80404518;
+    const EVIOCGBIT_KEY_64: libc::c_ulong = 0x80404521;
+
+    static KEYBOARD_DEVS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+        let mut list = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/dev/input") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("event") {
+                        if let Ok(file) = File::open(&path) {
+                            let fd = file.as_raw_fd();
+                            let mut cap_mask = [0u8; 64];
+                            let ret = unsafe { libc::ioctl(fd, EVIOCGBIT_KEY_64, cap_mask.as_mut_ptr()) };
+                            if ret >= 0 {
+                                let byte_idx = KEY_LEFTMETA / 8;
+                                let bit_idx = KEY_LEFTMETA % 8;
+                                if (cap_mask[byte_idx] & (1 << bit_idx)) != 0 {
+                                    list.push(path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        list
+    });
+    let devs = &*KEYBOARD_DEVS;
+
+    for path in devs {
+        if let Ok(file) = File::open(path) {
+            let fd = file.as_raw_fd();
+            let mut key_mask = [0u8; 64];
+            let ret = unsafe { libc::ioctl(fd, EVIOCGKEY_64, key_mask.as_mut_ptr()) };
+            if ret >= 0 {
+                let left_byte = KEY_LEFTMETA / 8;
+                let left_bit = KEY_LEFTMETA % 8;
+                let right_byte = KEY_RIGHTMETA / 8;
+                let right_bit = KEY_RIGHTMETA % 8;
+                if (key_mask[left_byte] & (1 << left_bit)) != 0
+                    || (key_mask[right_byte] & (1 << right_bit)) != 0
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn detect_super_key_windows() -> bool {
+    extern "system" {
+        fn GetAsyncKeyState(vKey: i32) -> i16;
+    }
+    const VK_LWIN: i32 = 0x5B;
+    const VK_RWIN: i32 = 0x5C;
+    unsafe {
+        (GetAsyncKeyState(VK_LWIN) as u16 & 0x8000 != 0)
+            || (GetAsyncKeyState(VK_RWIN) as u16 & 0x8000 != 0)
+    }
+}
+
+/// Detect whether the Special Windows / Super key is currently pressed on the host
+pub fn is_super_key_down(ctx: &egui::Context) -> bool {
+    // 1. egui modifier state check (e.g. macOS Cmd or platforms exposing command)
+    if ctx.input(|i| i.modifiers.mac_cmd) {
+        return true;
+    }
+
+    // 2. Linux evdev hardware key state
+    #[cfg(target_os = "linux")]
+    {
+        if detect_super_key_linux() {
+            return true;
+        }
+    }
+
+    // 3. Windows GetAsyncKeyState hardware key state
+    #[cfg(target_os = "windows")]
+    {
+        if detect_super_key_windows() {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -409,6 +655,21 @@ mod tests {
         assert_eq!(key_to_ps2_scancode(Key::ArrowUp), Some(0xE048));
         assert_eq!(key_to_ps2_scancode(Key::ArrowDown), Some(0xE050));
         assert_eq!(key_to_ps2_scancode(Key::F10), Some(0x44));
+
+        // F12 must NEVER be mapped to a scancode (lockout protection)
+        assert_eq!(key_to_ps2_scancode(Key::F12), None);
+
+        // Navigation keys
+        assert_eq!(key_to_ps2_scancode(Key::Insert), Some(0xE052));
+        assert_eq!(key_to_ps2_scancode(Key::Delete), Some(0xE053));
+        assert_eq!(key_to_ps2_scancode(Key::Home), Some(0xE047));
+        assert_eq!(key_to_ps2_scancode(Key::End), Some(0xE04F));
+
+        // Punctuation
+        assert_eq!(key_to_ps2_scancode(Key::Semicolon), Some(0x27));
+        assert_eq!(key_to_ps2_scancode(Key::Comma), Some(0x33));
+        assert_eq!(key_to_ps2_scancode(Key::Period), Some(0x34));
+        assert_eq!(key_to_ps2_scancode(Key::Slash), Some(0x35));
     }
 
     #[test]
@@ -431,22 +692,22 @@ mod tests {
     #[test]
     fn test_mouse_sensitivity_subpixel_accumulation() {
         let mut handler = InputHandler::new();
-        assert_eq!(handler.sensitivity, 0.15);
+        assert_eq!(handler.sensitivity, 1.0);
 
-        // delta of 2.0 points with 0.15 sens = 0.30 -> send_dx = 0, remainder 0.30
-        handler.accum_x += 2.0 * handler.sensitivity;
+        // delta of 0.4 points with 1.0 sens = 0.4 -> send_dx = 0, remainder 0.4
+        handler.accum_x += 0.4 * handler.sensitivity;
         let eps = if handler.accum_x >= 0.0 { 1e-4 } else { -1e-4 };
         let send_dx = (handler.accum_x + eps).trunc() as i16;
         assert_eq!(send_dx, 0);
-        assert!((handler.accum_x - 0.30).abs() < 1e-3);
+        assert!((handler.accum_x - 0.40).abs() < 1e-3);
 
-        // After 5 more points (total 7 points * 0.15 = 1.05): send_dx = 1, remainder 0.05
-        handler.accum_x += 5.0 * handler.sensitivity;
+        // After 0.8 more points (total 1.2 * 1.0 = 1.2): send_dx = 1, remainder 0.20
+        handler.accum_x += 0.8 * handler.sensitivity;
         let eps2 = if handler.accum_x >= 0.0 { 1e-4 } else { -1e-4 };
         let send_dx2 = (handler.accum_x + eps2).trunc() as i16;
         assert_eq!(send_dx2, 1);
         handler.accum_x -= send_dx2 as f32;
-        assert!((handler.accum_x - 0.05).abs() < 1e-3);
+        assert!((handler.accum_x - 0.20).abs() < 1e-3);
     }
 
     #[test]
@@ -458,5 +719,36 @@ mod tests {
         } else {
             panic!("Expected Event::MouseMoved");
         }
+    }
+
+    #[test]
+    fn test_lockout_protection_f12_not_mapped() {
+        // F12 must NEVER map to any guest scancode (lockout protection guarantee)
+        assert_eq!(key_to_ps2_scancode(Key::F12), None);
+    }
+
+    #[test]
+    fn test_is_super_key_down_safety() {
+        let ctx = egui::Context::default();
+        // Must execute safely on current platform without panicking
+        let _ = is_super_key_down(&ctx);
+    }
+
+    #[test]
+    fn test_modifier_tracking_state() {
+        let mut handler = InputHandler::new();
+        assert_eq!(handler.sensitivity, 1.0);
+        assert_eq!(handler.last_modifiers, egui::Modifiers::default());
+        assert!(!handler.last_super_down);
+
+        // Simulate modifiers changing
+        handler.last_modifiers.shift = true;
+        handler.last_modifiers.ctrl = true;
+        handler.last_super_down = true;
+
+        // set_confined(false) resets modifier tracking
+        handler.set_confined(false);
+        assert_eq!(handler.last_modifiers, egui::Modifiers::default());
+        assert!(!handler.last_super_down);
     }
 }
