@@ -38,19 +38,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rt.block_on(run_headless_mode(args))
     } else {
         // Native GUI Mode with eframe
-        let target_arg = args.get(1).and_then(|a| {
-            if a.starts_with("--") {
-                None
-            } else {
-                Some(a.clone())
-            }
-        });
+        let is_obs_mode = args.iter().any(|a| a == "--obs" || a == "--source-mode" || a == "--fixed-1x");
+        let target_arg = args.iter().skip(1).find(|a| !a.starts_with("--")).cloned();
+
+        let initial_title = if is_obs_mode {
+            "xpdash (OBS Source)"
+        } else {
+            "xpdash — Windows XP Remote Console"
+        };
 
         let native_options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_title("xpdash — Windows XP Remote Console")
-                .with_inner_size([1024.0, 768.0])
-                .with_min_inner_size([640.0, 480.0])
+                .with_title(initial_title)
+                .with_inner_size(if is_obs_mode { [800.0, 600.0] } else { [1024.0, 768.0] })
+                .with_min_inner_size([320.0, 240.0])
                 .with_active(true),
             vsync: false, // Decouple paint rate from host monitor — present frames immediately
             ..Default::default()
@@ -62,11 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()?;
         let _guard = _rt.enter();
 
-        log::info!("Launching eframe native GUI window...");
+        log::info!("Launching eframe native GUI window (OBS source mode: {})...", is_obs_mode);
         eframe::run_native(
             "xpdash-client",
             native_options,
-            Box::new(move |cc| Ok(Box::new(app::XpDashApp::new(cc, target_arg)))),
+            Box::new(move |cc| Ok(Box::new(app::XpDashApp::new(cc, target_arg, is_obs_mode)))),
         )?;
 
         Ok(())

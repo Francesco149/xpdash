@@ -23,6 +23,7 @@ impl HudOverlay {
         input: &mut InputHandler,
         audio: &AudioController,
         aspect_mode: &mut AspectRatioMode,
+        obs_source_mode: &mut bool,
         cursor_pos: Option<Pos2>,
         window_size: Vec2,
     ) -> bool {
@@ -161,6 +162,17 @@ impl HudOverlay {
 
                             ui.separator();
 
+                            // OBS 1x Source Mode Toggle
+                            let obs_text = if *obs_source_mode {
+                                egui::RichText::new("🎥 OBS 1x: ON").color(Color32::from_rgb(46, 204, 113))
+                            } else {
+                                egui::RichText::new("🎥 OBS 1x: OFF").color(Color32::from_rgb(180, 190, 205))
+                            };
+                            if ui.button(obs_text).on_hover_text("OBS Source Mode [F9]: locks window inner size to 1x native stream resolution, auto-resizes on in-game resolution change, removes borders, and sets stable window title for OBS Window/Game Capture.").clicked() {
+                                *obs_source_mode = !*obs_source_mode;
+                            }
+
+                            ui.separator();
                             // Send Ctrl+Alt+Del
                             if ui.button("Send Ctrl+Alt+Del").clicked() {
                                 InputHandler::send_ctrl_alt_del(session);

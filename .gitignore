@@ -1,6 +1,7 @@
 # target directories
 target/
 build/
+dist/
 *.exe
 *.o
 *.a

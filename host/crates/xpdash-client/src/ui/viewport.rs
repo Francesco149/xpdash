@@ -45,6 +45,7 @@ impl StreamViewport {
         ui: &mut egui::Ui,
         session: &ClientSession,
         input: &mut InputHandler,
+        obs_mode: bool,
     ) -> Rect {
         let ctx = ui.ctx();
         let latest = session.latest_frame();
@@ -89,15 +90,16 @@ impl StreamViewport {
 
         let (guest_w, guest_h) = latest.as_ref().map(|f| (f.width as f32, f.height as f32)).unwrap_or((800.0, 600.0));
 
-        let target_size = calculate_target_size(self.aspect_mode, avail_size, guest_w, guest_h);
-
-        // Center viewport inside available space
-        let offset = (avail_size - target_size) * 0.5;
-        let viewport_rect = Rect::from_min_size(avail_rect.min + offset, target_size);
-
-        // Fill background with deep black pillars
-        ui.painter().rect_filled(avail_rect, CornerRadius::ZERO, Color32::BLACK);
-
+        let viewport_rect = if obs_mode {
+            // OBS Source Mode: Fill 100% of the window area with 0 borders and 0 letterboxing
+            avail_rect
+        } else {
+            let target_size = calculate_target_size(self.aspect_mode, avail_size, guest_w, guest_h);
+            let offset = (avail_size - target_size) * 0.5;
+            // Fill background with deep black pillars in interactive mode
+            ui.painter().rect_filled(avail_rect, CornerRadius::ZERO, Color32::BLACK);
+            Rect::from_min_size(avail_rect.min + offset, target_size)
+        };
         // 4. Paint Texture
         if let Some(tex) = &self.texture {
             let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
@@ -114,16 +116,17 @@ impl StreamViewport {
             );
         }
 
-        // 5. Ambient Confinement Border
-        let (border_color, stroke_width) = match input.mode {
-            ConfinementMode::Confined if input.is_at_edge => {
-                (Color32::from_rgb(235, 87, 87), 3.0f32) // Red warning: hit window edge in niri/Wayland (press F11 for Fullscreen)
-            }
-            ConfinementMode::Confined => (Color32::from_rgb(255, 170, 0), 2.5f32), // Amber glow
-            ConfinementMode::Unconfined => (Color32::from_rgb(0, 180, 216), 1.5f32), // Cyan subtle border
-        };
-        ui.painter().rect_stroke(viewport_rect, CornerRadius::ZERO, Stroke::new(stroke_width, border_color), StrokeKind::Inside);
-
+        // 5. Ambient Confinement Border (only when NOT in OBS Source Mode)
+        if !obs_mode {
+            let (border_color, stroke_width) = match input.mode {
+                ConfinementMode::Confined if input.is_at_edge => {
+                    (Color32::from_rgb(235, 87, 87), 3.0f32) // Red warning: hit window edge in niri/Wayland (press F11 for Fullscreen)
+                }
+                ConfinementMode::Confined => (Color32::from_rgb(255, 170, 0), 2.5f32), // Amber glow
+                ConfinementMode::Unconfined => (Color32::from_rgb(0, 180, 216), 1.5f32), // Cyan subtle border
+            };
+            ui.painter().rect_stroke(viewport_rect, CornerRadius::ZERO, Stroke::new(stroke_width, border_color), StrokeKind::Inside);
+        }
         // Request continuous repaint — use Duration::ZERO for immediate scheduling
         ctx.request_repaint();
 
