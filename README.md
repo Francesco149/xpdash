@@ -24,6 +24,66 @@ Designed specifically for period-correct retro gaming rigs (e.g. `timemachine` i
 
 ---
 
+## Quick Start Guide
+
+### Step 1: Install & Start the Agent on Windows XP
+
+1. Download **`xpdash-agent-winxp.zip`** from the [Latest Nightly Release](https://github.com/headpats/xpdash/releases/tag/nightly) (or build it via `bash scripts/package-release.sh`).
+2. Extract the archive to `C:\xpdash\` on your Windows XP machine.
+3. Open an Administrator Command Prompt in `C:\xpdash\` (or double-click) and run:
+   ```cmd
+   install-agent.bat
+   ```
+   This script:
+   - Configures Windows Firewall rules for TCP port 7020 (Control) and UDP ports 7021 (Media) and 7022 (Discovery).
+   - Generates a default `agent.ini` configuration.
+   - Copies `xpdash-agent.exe` and hook DLLs (`xpdash-hook.dll`, `xpdash-hook9.dll`).
+   - Registers `xpdash-agent.exe` to run automatically at startup (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`).
+   - Launches `xpdash-agent.exe` immediately on console session 0.
+4. The agent is now running silently in the background, listening on TCP port 7020.
+   *(To uninstall at any time, run `uninstall-agent.bat`).*
+
+---
+
+### Step 2: Run the Client on Modern Linux or Windows 10/11
+
+#### On Linux (Wayland / X11):
+1. Download **`xpdash-linux-x86_64.tar.gz`** from the [Latest Nightly Release](https://github.com/headpats/xpdash/releases/tag/nightly) and extract it:
+   ```bash
+   tar -xzf xpdash-linux-x86_64.tar.gz
+   cd xpdash-linux-x86_64
+   ```
+2. Launch the client:
+   ```bash
+   # Open the GUI machine discovery dashboard:
+   ./run-client.sh
+
+   # Or connect directly to your XP machine by IP:
+   ./run-client.sh 10.0.10.113
+
+   # Or launch directly in OBS Virtual Capture Card mode:
+   ./run-obs.sh 10.0.10.113
+   ```
+
+#### On Windows 10/11:
+1. Download **`xpdash-client-windows-x86_64.zip`** from the [Latest Nightly Release](https://github.com/headpats/xpdash/releases/tag/nightly) and extract it.
+2. Double-click **`run-client.bat`** (or `xpdash-client.exe`) to open the GUI dashboard.
+   - Discovered Windows XP rigs on your local network will appear as interactive cards showing machine name, live RTT latency, resolution, and audio hardware.
+   - Click **`▶ Connect to Console`** on the machine card (or type the IP into the Quick Connect bar).
+   - To launch directly in 1x OBS Source mode, double-click **`run-obs.bat`**.
+
+---
+
+### Step 3: In-Stream Controls & Hotkeys
+
+- **`F10`** (or hover cursor within 16px of top edge): Open/close the slide-down **In-Game HUD** overlay with live telemetry (FPS counter, RTT latency, bitrate, audio jitter), audio volume slider, mute toggle, mouse sensitivity slider, and aspect-ratio scaling modes.
+- **`F12`**: Toggle mouse pointer lock (Confined / Unconfined).
+- **`F9`**: Toggle OBS 1x Fixed Source Mode on/off.
+- **`F11`**: Toggle Fullscreen.
+- **`Right-Ctrl`**: Release captured mouse cursor to host.
+- In HUD: Click **`Send Ctrl+Alt+Del`** to unlock Windows XP or open Task Manager.
+
+---
 ## OBS Studio Guide: Virtual Capture Card Mode
 
 Using `xpdash` as a virtual capture card is significantly more convenient and reliable than physical HDMI/VGA capture cards:

@@ -29,8 +29,9 @@ if errorlevel 1 (
     echo.
     pause
     exit /b 1
-)
 
+if exist "xpdash-hook.dll" copy /Y xpdash-hook.dll "%TARGET_DIR%\xpdash-hook.dll" >nul
+if exist "xpdash-hook9.dll" copy /Y xpdash-hook9.dll "%TARGET_DIR%\xpdash-hook9.dll" >nul
 if exist "agent.ini" (
     echo [*] Copying pre-configured agent.ini to %TARGET_DIR%...
     copy /Y agent.ini "%TARGET_DIR%\agent.ini" >nul
