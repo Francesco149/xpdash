@@ -26,6 +26,11 @@ put xpdash-hook9.dll;
 lcd ../../deploy;
 put agent.ini;
 "
+echo "=== Ensuring autostart on boot (HKLM Run) ==="
+nix run nixpkgs#netexec -- smb "$XP" -u Administrator -p '' -x 'reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v xpdash-agent /t REG_SZ /d "C:\xpdash\xpdash-agent.exe" /f' >/dev/null
+
+echo "=== Configuring Windows Firewall exceptions ==="
+nix run nixpkgs#netexec -- smb "$XP" -u Administrator -p '' -x 'netsh firewall add allowedprogram "C:\xpdash\xpdash-agent.exe" "xpdash Agent" ENABLE >nul 2>&1 & netsh firewall add portopening TCP 7020 "xpdash Control" ENABLE >nul 2>&1 & netsh firewall add portopening UDP 7021 "xpdash Media" ENABLE >nul 2>&1 & netsh firewall add portopening UDP 7022 "xpdash Discovery" ENABLE >nul 2>&1' >/dev/null || true
 
 echo "=== Launching xpdash-agent.exe on console session ==="
 nix run nixpkgs#netexec -- smb "$XP" -u Administrator -p '' --exec-method smbexec -x 'C:\probe\iexec.exe C:\xpdash\xpdash-agent.exe'
