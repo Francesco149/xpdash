@@ -31,19 +31,27 @@ static HMODULE g_remote_dll_base = NULL;
 
 /* ─── Init / Shutdown ─────────────────────────────────────────────────── */
 
-/* Resolve Present and Reset RVAs dynamically from d3d9.dll once at startup */
-static void resolve_d3d9_rvas(uint32_t *p_present_rva, uint32_t *p_reset_rva) {
+/* Resolve Present, Reset, and CreateDevice RVAs dynamically from d3d9.dll once at startup */
+static void resolve_d3d9_rvas(uint32_t *p_present_rva, uint32_t *p_reset_rva, uint32_t *p_create_rva) {
     *p_present_rva = 0x40EA0; /* Standard XP SP3 default fallback */
     *p_reset_rva   = 0x436B0;
+    *p_create_rva  = 0x81670;
 
     HMODULE hd3d9 = LoadLibraryA("d3d9.dll");
     if (!hd3d9) return;
 
+    uintptr_t base = (uintptr_t)hd3d9;
     typedef IDirect3D9 *(WINAPI *Direct3DCreate9_t)(UINT);
     Direct3DCreate9_t pCreate9 = (Direct3DCreate9_t)(void *)GetProcAddress(hd3d9, "Direct3DCreate9");
     if (pCreate9) {
         IDirect3D9 *d3d = pCreate9(D3D_SDK_VERSION);
         if (d3d) {
+            void **vt_d3d = *(void ***)d3d;
+            uintptr_t create_addr = (uintptr_t)vt_d3d[16];
+            if (create_addr > base) {
+                *p_create_rva = (uint32_t)(create_addr - base);
+            }
+
             HWND hwnd = CreateWindowExA(0, "STATIC", "xpdash_probe", WS_POPUP, 0, 0, 1, 1, NULL, NULL, GetModuleHandleA(NULL), NULL);
             D3DPRESENT_PARAMETERS pp;
             memset(&pp, 0, sizeof(pp));
@@ -57,12 +65,9 @@ static void resolve_d3d9_rvas(uint32_t *p_present_rva, uint32_t *p_reset_rva) {
                 void **vt = *(void ***)dev;
                 uintptr_t present_addr = (uintptr_t)vt[17];
                 uintptr_t reset_addr   = (uintptr_t)vt[16];
-                uintptr_t base         = (uintptr_t)hd3d9;
                 if (present_addr > base && reset_addr > base) {
                     *p_present_rva = (uint32_t)(present_addr - base);
                     *p_reset_rva   = (uint32_t)(reset_addr - base);
-                    agent_log("d3d9hook_init: resolved D3D9 RVAs dynamically: Present=0x%lX, Reset=0x%lX",
-                              (unsigned long)*p_present_rva, (unsigned long)*p_reset_rva);
                 }
                 dev->lpVtbl->Release(dev);
             }
@@ -70,6 +75,8 @@ static void resolve_d3d9_rvas(uint32_t *p_present_rva, uint32_t *p_reset_rva) {
             d3d->lpVtbl->Release(d3d);
         }
     }
+    agent_log("d3d9hook_init: resolved D3D9 RVAs: Present=0x%lX, Reset=0x%lX, CreateDevice=0x%lX",
+              (unsigned long)*p_present_rva, (unsigned long)*p_reset_rva, (unsigned long)*p_create_rva);
 }
 
 int d3d9hook_init(void) {
@@ -87,8 +94,8 @@ int d3d9hook_init(void) {
     g_injected_pid  = 0;
     g_remote_dll_base = NULL;
 
-    uint32_t present_rva = 0, reset_rva = 0;
-    resolve_d3d9_rvas(&present_rva, &reset_rva);
+    uint32_t present_rva = 0, reset_rva = 0, create_rva = 0;
+    resolve_d3d9_rvas(&present_rva, &reset_rva, &create_rva);
 
     /* Pre-create shared memory mapping and write dynamic RVAs so injected hook can read them */
     g_shm_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
@@ -98,8 +105,9 @@ int d3d9hook_init(void) {
         if (g_shm_ptr) {
             HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
             hdr->magic = 0x48443344;
-            hdr->present_rva = present_rva;
-            hdr->reset_rva   = reset_rva;
+            hdr->present_rva       = present_rva;
+            hdr->reset_rva         = reset_rva;
+            hdr->create_device_rva = create_rva;
             hdr->hook_active = 0;
         }
     }

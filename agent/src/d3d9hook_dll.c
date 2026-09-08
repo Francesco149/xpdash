@@ -53,10 +53,11 @@ typedef struct {
     volatile uint32_t format;         /* D3DFORMAT value */
     volatile uint32_t producer_seq;   /* incremented by hook on each frame */
     volatile uint32_t consumer_seq;   /* incremented by agent after reading */
-    volatile uint32_t hook_active;    /* 1 = hook is installed and running */
-    volatile uint32_t present_rva;    /* RVA of Present in d3d9.dll (e.g. 0x40EA0) */
-    volatile uint32_t reset_rva;      /* RVA of Reset in d3d9.dll (e.g. 0x436B0) */
-    uint8_t           reserved[16];   /* pad to 64 bytes */
+    volatile uint32_t hook_active;        /* 1 = hook is installed and running */
+    volatile uint32_t present_rva;        /* RVA of Present in d3d9.dll (e.g. 0x40EA0) */
+    volatile uint32_t reset_rva;          /* RVA of Reset in d3d9.dll (e.g. 0x436B0) */
+    volatile uint32_t create_device_rva;  /* RVA of CreateDevice in d3d9.dll (e.g. 0x81670) */
+    uint8_t           reserved[12];       /* pad to 64 bytes */
     /* Pixel data follows at offset 64 */
 } HookShmHeader;
 
@@ -71,16 +72,21 @@ typedef struct {
 #define VTBL_IDX_GETBACKBUF   18
 #define VTBL_IDX_ENDSCENE     42
 /* ─── Function pointer types ──────────────────────────────────────────── */
-
 typedef HRESULT (WINAPI *Present_t)(IDirect3DDevice9 *dev,
     const RECT *src, const RECT *dst, HWND hWnd, const RGNDATA *dirty);
 typedef HRESULT (WINAPI *Reset_t)(IDirect3DDevice9 *dev,
     D3DPRESENT_PARAMETERS *pp);
+typedef HRESULT (WINAPI *CreateDevice_t)(IDirect3D9 *d3d, UINT Adapter, D3DDEVTYPE DeviceType,
+    HWND hFocusWindow, DWORD BehaviorFlags,
+    D3DPRESENT_PARAMETERS *pPresentationParameters,
+    IDirect3DDevice9 **ppReturnedDeviceInterface);
 
 /* ─── Globals ─────────────────────────────────────────────────────────── */
 
-static Present_t  g_orig_present  = NULL;
-static Reset_t    g_orig_reset    = NULL;
+static Present_t      g_orig_present       = NULL;
+static Reset_t        g_orig_reset         = NULL;
+static CreateDevice_t g_orig_create_device = NULL;
+static IDirect3DDevice9 *g_cur_dev         = NULL;
 static HANDLE  g_shm_handle = NULL;
 static void   *g_shm_ptr    = NULL;
 static HANDLE  g_frame_event = NULL;  /* signaled when a frame is ready */
@@ -119,10 +125,12 @@ static int shm_init(void) {
     HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
     uint32_t saved_present_rva = (hdr->magic == 0x48443344) ? hdr->present_rva : 0;
     uint32_t saved_reset_rva   = (hdr->magic == 0x48443344) ? hdr->reset_rva : 0;
+    uint32_t saved_create_rva  = (hdr->magic == 0x48443344) ? hdr->create_device_rva : 0;
     memset(hdr, 0, SHM_HEADER_SIZE);
     hdr->magic = 0x48443344;  /* 'D3DH' */
-    hdr->present_rva = saved_present_rva;
-    hdr->reset_rva   = saved_reset_rva;
+    hdr->present_rva       = saved_present_rva;
+    hdr->reset_rva         = saved_reset_rva;
+    hdr->create_device_rva = saved_create_rva;
     hdr->hook_active = 0;
     return 1;
 }
@@ -155,13 +163,15 @@ static void release_sysmem_surf(void) {
     g_surf_width = 0;
     g_surf_height = 0;
     g_surf_format = D3DFMT_UNKNOWN;
+    g_cur_dev = NULL;
 }
 
 static int ensure_sysmem_surf(IDirect3DDevice9 *dev, uint32_t w, uint32_t h, D3DFORMAT fmt) {
-    if (g_sysmem_surf && g_surf_width == w && g_surf_height == h && g_surf_format == fmt)
+    if (g_sysmem_surf && g_cur_dev == dev && g_surf_width == w && g_surf_height == h && g_surf_format == fmt)
         return 1;
 
     release_sysmem_surf();
+    g_cur_dev = dev;
 
     HRESULT hr = dev->lpVtbl->CreateOffscreenPlainSurface(
         dev, w, h, fmt, D3DPOOL_SYSTEMMEM, &g_sysmem_surf, NULL);
@@ -178,7 +188,7 @@ static int ensure_sysmem_surf(IDirect3DDevice9 *dev, uint32_t w, uint32_t h, D3D
 }
 
 static int ensure_resolve_surf(IDirect3DDevice9 *dev, uint32_t w, uint32_t h, D3DFORMAT fmt) {
-    if (g_resolve_surf && g_surf_width == w && g_surf_height == h && g_surf_format == fmt)
+    if (g_resolve_surf && g_cur_dev == dev && g_surf_width == w && g_surf_height == h && g_surf_format == fmt)
         return 1;
 
     if (g_resolve_surf) {
@@ -344,6 +354,13 @@ static HRESULT WINAPI hook_present(IDirect3DDevice9 *dev,
     }
     /* Capture BEFORE the original Present — back buffer is complete */
     EnterCriticalSection(&g_cs);
+    if (dev != g_cur_dev) {
+        if (g_cur_dev != NULL) {
+            hook_log("hook_present: device changed from %p to %p, refreshing capture surfaces", g_cur_dev, dev);
+        }
+        release_sysmem_surf();
+        g_cur_dev = dev;
+    }
     capture_backbuffer(dev);
     LeaveCriticalSection(&g_cs);
 
@@ -353,23 +370,70 @@ static HRESULT WINAPI hook_present(IDirect3DDevice9 *dev,
 static HRESULT WINAPI hook_reset(IDirect3DDevice9 *dev,
     D3DPRESENT_PARAMETERS *pp)
 {
-    /* Release D3D resources before Reset */
+    hook_log("hook_reset: game resetting device %p (%ux%u)",
+             dev, pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+
+    /* Release D3D resources before Reset so D3D9 Reset() doesn't fail with D3DERR_DEVICELOST */
     EnterCriticalSection(&g_cs);
     release_sysmem_surf();
     LeaveCriticalSection(&g_cs);
 
-    return g_orig_reset(dev, pp);
+    HRESULT hr = g_orig_reset(dev, pp);
+    hook_log("hook_reset: Reset returned 0x%08lX", (unsigned long)hr);
+    return hr;
 }
 
+static HRESULT WINAPI hook_create_device(IDirect3D9 *d3d, UINT Adapter, D3DDEVTYPE DeviceType,
+                                         HWND hFocusWindow, DWORD BehaviorFlags,
+                                         D3DPRESENT_PARAMETERS *pp,
+                                         IDirect3DDevice9 **ppDev)
+{
+    hook_log("hook_create_device: game creating D3D9 device (type=%u, flags=0x%lx, res=%ux%u)",
+             (unsigned int)DeviceType, (unsigned long)BehaviorFlags,
+             pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+
+    /* Release any surfaces from older devices so the old device is fully freed in COM */
+    EnterCriticalSection(&g_cs);
+    release_sysmem_surf();
+    LeaveCriticalSection(&g_cs);
+
+    HRESULT hr = D3D_OK;
+    int max_retries = 6;
+    for (int retry = 0; retry < max_retries; retry++) {
+        hr = g_orig_create_device(d3d, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pp, ppDev);
+        if (SUCCEEDED(hr) && ppDev && *ppDev) {
+            if (retry > 0) {
+                hook_log("hook_create_device: succeeded after retry %d (dev=%p)", retry, *ppDev);
+            } else {
+                hook_log("hook_create_device: succeeded (dev=%p)", *ppDev);
+            }
+            return hr;
+        }
+
+        /* Transient errors during screen resolution / display mode switch */
+        if (hr == D3DERR_DEVICELOST || hr == D3DERR_NOTAVAILABLE || hr == D3DERR_INVALIDCALL) {
+            hook_log("hook_create_device: transient failure 0x%08lX on attempt %d/%d, retrying after 50ms...",
+                     (unsigned long)hr, retry + 1, max_retries);
+            Sleep(50);
+        } else {
+            break;
+        }
+    }
+
+    hook_log("hook_create_device: final result hr=0x%08lX", (unsigned long)hr);
+    return hr;
+}
 /* ─── Microsoft Hotpatch Detours ───────────────────────────────────────── */
 
 static uint8_t  g_present_trampoline[8];
 static uint8_t  g_reset_trampoline[8];
+static uint8_t  g_create_device_trampoline[8];
 static uint8_t *g_hooked_present_addr = NULL;
 static uint8_t *g_hooked_reset_addr = NULL;
+static uint8_t *g_hooked_create_device_addr = NULL;
 static uint8_t  g_orig_present_bytes[5];
 static uint8_t  g_orig_reset_bytes[5];
-
+static uint8_t  g_orig_create_device_bytes[5];
 static int install_hotpatch(void *target, void *hook, uint8_t *trampoline, void **p_orig, uint8_t *saved_bytes) {
     uint8_t *p = (uint8_t *)target;
     if (IsBadReadPtr(p, 5)) {
@@ -431,16 +495,19 @@ static int install_hooks(void) {
         return 0;
     }
 
-    uint32_t present_rva = 0x40EA0;
-    uint32_t reset_rva   = 0x436B0;
+    uint32_t present_rva       = 0x40EA0;
+    uint32_t reset_rva         = 0x436B0;
+    uint32_t create_device_rva = 0x81670;
     if (g_shm_ptr) {
         HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
-        if (hdr->present_rva != 0) present_rva = hdr->present_rva;
-        if (hdr->reset_rva != 0)   reset_rva   = hdr->reset_rva;
+        if (hdr->present_rva != 0)       present_rva       = hdr->present_rva;
+        if (hdr->reset_rva != 0)         reset_rva         = hdr->reset_rva;
+        if (hdr->create_device_rva != 0) create_device_rva = hdr->create_device_rva;
     }
 
-    uint8_t *pPresent = (uint8_t *)((uintptr_t)hd3d9 + present_rva);
-    uint8_t *pReset   = (uint8_t *)((uintptr_t)hd3d9 + reset_rva);
+    uint8_t *pPresent       = (uint8_t *)((uintptr_t)hd3d9 + present_rva);
+    uint8_t *pReset         = (uint8_t *)((uintptr_t)hd3d9 + reset_rva);
+    uint8_t *pCreateDevice  = (uint8_t *)((uintptr_t)hd3d9 + create_device_rva);
 
     int ok_present = install_hotpatch(pPresent, (void *)hook_present, g_present_trampoline,
                                       (void **)&g_orig_present, g_orig_present_bytes);
@@ -461,6 +528,18 @@ static int install_hooks(void) {
                  pReset, g_orig_reset);
     } else {
         hook_log("install_hooks: Reset hotpatch failed (will continue with Present hook only)");
+    }
+
+    int ok_create = install_hotpatch(pCreateDevice, (void *)hook_create_device,
+                                     g_create_device_trampoline,
+                                     (void **)&g_orig_create_device,
+                                     g_orig_create_device_bytes);
+    if (ok_create) {
+        g_hooked_create_device_addr = pCreateDevice;
+        hook_log("install_hooks: CreateDevice hotpatched successfully at %p (orig_create=%p)",
+                 pCreateDevice, g_orig_create_device);
+    } else {
+        hook_log("install_hooks: CreateDevice hotpatch failed (RVA 0x%lX)", (unsigned long)create_device_rva);
     }
 
     return 1;
@@ -484,9 +563,16 @@ static void remove_hooks(void) {
         }
         g_hooked_reset_addr = NULL;
     }
+    if (g_hooked_create_device_addr) {
+        if (VirtualProtect(g_hooked_create_device_addr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            memcpy(g_hooked_create_device_addr, g_orig_create_device_bytes, 5);
+            VirtualProtect(g_hooked_create_device_addr, 5, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), g_hooked_create_device_addr, 5);
+        }
+        g_hooked_create_device_addr = NULL;
+    }
     hook_log("remove_hooks: hotpatch detours restored cleanly");
 }
-
 /* ─── DLL Exports & Entry Point ───────────────────────────────────────── */
 
 __declspec(dllexport) int install_d3d9_hooks(void) {
