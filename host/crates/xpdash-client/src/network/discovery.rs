@@ -355,4 +355,23 @@ mod tests {
         assert_eq!(roster.read().len(), 1);
         assert_eq!(roster.read()[0].rtt_ms, Some(0.95));
     }
+
+    #[tokio::test]
+    #[ignore = "requires physical Windows XP LAN testbeds (10.0.10.113 and 10.0.10.134)"]
+    async fn test_live_lan_discovery_multiple_hosts() {
+        let disc = DiscoveryService::start(false);
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let rigs = disc.roster().read().clone();
+            if rigs.len() >= 2 {
+                break;
+            }
+        }
+        let rigs = disc.roster().read().clone();
+        println!("Discovered {} rigs:", rigs.len());
+        for rig in &rigs {
+            println!("  - {} ({}) @ {}x{}@{}bpp, latency: {:?}", rig.name, rig.ip, rig.screen_width, rig.screen_height, rig.bpp, rig.rtt_ms);
+        }
+        assert!(rigs.len() >= 2, "Expected at least 2 rigs discovered, found {}", rigs.len());
+    }
 }
