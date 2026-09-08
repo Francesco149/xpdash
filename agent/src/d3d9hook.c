@@ -16,6 +16,9 @@
 
 /* ─── State ───────────────────────────────────────────────────────────── */
 
+static CRITICAL_SECTION g_hook_cs;
+static int g_hook_cs_inited = 0;
+
 static HANDLE  g_shm_handle   = NULL;
 static void   *g_shm_ptr      = NULL;
 static HANDLE  g_frame_event  = NULL;
@@ -24,9 +27,15 @@ static uint32_t g_last_seq    = 0;
 static HANDLE  g_injected_proc = NULL;
 static DWORD   g_injected_pid  = 0;
 static HMODULE g_remote_dll_base = NULL;
+
 /* ─── Init / Shutdown ─────────────────────────────────────────────────── */
 
 int d3d9hook_init(void) {
+    if (!g_hook_cs_inited) {
+        InitializeCriticalSection(&g_hook_cs);
+        g_hook_cs_inited = 1;
+    }
+    EnterCriticalSection(&g_hook_cs);
     g_shm_handle   = NULL;
     g_shm_ptr      = NULL;
     g_frame_event  = NULL;
@@ -35,10 +44,12 @@ int d3d9hook_init(void) {
     g_injected_proc = NULL;
     g_injected_pid  = 0;
     g_remote_dll_base = NULL;
+    LeaveCriticalSection(&g_hook_cs);
     return 1;
 }
 
-static int open_shm(void) {
+/* Must be called while holding g_hook_cs */
+static int open_shm_locked(void) {
     if (g_shm_ptr) return 1;  /* already open */
 
     g_shm_handle = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE,
@@ -66,7 +77,8 @@ static int open_shm(void) {
     return 1;
 }
 
-static void close_shm(void) {
+/* Must be called while holding g_hook_cs */
+static void close_shm_locked(void) {
     if (g_shm_ptr)      { UnmapViewOfFile(g_shm_ptr); g_shm_ptr = NULL; }
     if (g_shm_handle)   { CloseHandle(g_shm_handle);  g_shm_handle = NULL; }
     if (g_frame_event)  { CloseHandle(g_frame_event);  g_frame_event = NULL; }
@@ -74,15 +86,20 @@ static void close_shm(void) {
 }
 
 void d3d9hook_shutdown(void) {
-    close_shm();
+    if (g_hook_cs_inited) EnterCriticalSection(&g_hook_cs);
+    close_shm_locked();
     if (g_injected_proc) {
         CloseHandle(g_injected_proc);
         g_injected_proc = NULL;
         g_injected_pid  = 0;
         g_remote_dll_base = NULL;
     }
+    if (g_hook_cs_inited) {
+        LeaveCriticalSection(&g_hook_cs);
+        DeleteCriticalSection(&g_hook_cs);
+        g_hook_cs_inited = 0;
+    }
 }
-
 /* ─── Process Detection ───────────────────────────────────────────────── */
 
 /* Find the PID of a process that has d3d9.dll loaded.
@@ -139,21 +156,24 @@ static DWORD find_d3d9_process(void) {
 /* ─── DLL Injection ───────────────────────────────────────────────────── */
 
 int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
+    if (!g_hook_cs_inited) d3d9hook_init();
+    EnterCriticalSection(&g_hook_cs);
+
     if (g_injected_proc) {
         DWORD code = 0;
         if (GetExitCodeProcess(g_injected_proc, &code) && code == STILL_ACTIVE) {
+            LeaveCriticalSection(&g_hook_cs);
             return 1;
         }
         agent_log("d3d9hook_inject: previously injected PID %lu exited, cleaning up",
                   (unsigned long)g_injected_pid);
-        close_shm();
+        close_shm_locked();
         CloseHandle(g_injected_proc);
         g_injected_proc = NULL;
         g_injected_pid  = 0;
         g_remote_dll_base = NULL;
     }
-
-    /* Auto-detect if no PID given */
+    LeaveCriticalSection(&g_hook_cs);
     if (target_pid == 0) {
         target_pid = find_d3d9_process();
         if (target_pid == 0) {
@@ -238,17 +258,24 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
        immediately, but the hook installation is deferred to a background
        thread (500ms delay for loader lock + device creation). Retry a
        few times. */
+    EnterCriticalSection(&g_hook_cs);
+    g_injected_proc = hProc;
+    g_injected_pid = target_pid;
+    g_remote_dll_base = (HMODULE)exit_code;
     int retries;
     for (retries = 0; retries < 10; retries++) {
-        Sleep(200);
-        if (open_shm()) {
+        if (open_shm_locked()) {
             agent_log("d3d9hook_inject: SHM ready after %dms", (retries + 1) * 200);
             break;
         }
+        LeaveCriticalSection(&g_hook_cs);
+        Sleep(200);
+        EnterCriticalSection(&g_hook_cs);
     }
     if (!g_shm_ptr) {
         agent_log("d3d9hook_inject: hook loaded but SHM not available after 2s, will retry on demand");
     }
+    LeaveCriticalSection(&g_hook_cs);
 
     return 1;
 }
@@ -279,28 +306,38 @@ static void d3d9hook_try_rehook(void) {
 /* ─── Frame Reading ───────────────────────────────────────────────────── */
 
 int d3d9hook_is_active(void) {
+    if (!g_hook_cs_inited) return 0;
+    EnterCriticalSection(&g_hook_cs);
+
     /* Always check if the injected process is still alive FIRST */
     if (g_injected_proc) {
         DWORD code = 0;
         if (GetExitCodeProcess(g_injected_proc, &code) && code != STILL_ACTIVE) {
             agent_log("d3d9hook: injected process PID %lu exited (code=%lu)",
                       (unsigned long)g_injected_pid, (unsigned long)code);
-            close_shm();
+            close_shm_locked();
             CloseHandle(g_injected_proc);
             g_injected_proc = NULL;
             g_injected_pid = 0;
             g_remote_dll_base = NULL;
+            LeaveCriticalSection(&g_hook_cs);
             return 0;
         }
     }
 
     /* Try to open SHM if not already open */
     if (!g_shm_ptr) {
-        if (!open_shm()) return 0;
+        if (!open_shm_locked()) {
+            LeaveCriticalSection(&g_hook_cs);
+            return 0;
+        }
     }
 
     HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
-    if (hdr->magic != 0x48443344) return 0;
+    if (hdr->magic != 0x48443344) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
     if (!hdr->hook_active) {
         static DWORD s_last_rehook_try = 0;
         DWORD now = timeGetTime();
@@ -308,31 +345,82 @@ int d3d9hook_is_active(void) {
             s_last_rehook_try = now;
             d3d9hook_try_rehook();
         }
+        LeaveCriticalSection(&g_hook_cs);
         return 0;
     }
 
+    LeaveCriticalSection(&g_hook_cs);
     return 1;
 }
 
 int d3d9hook_read_frame(uint8_t *pixels, uint32_t *width, uint32_t *height,
                         uint32_t *frame_index, DWORD timeout_ms)
 {
-    if (!g_shm_ptr && !open_shm()) return 0;
+    if (!g_hook_cs_inited) return 0;
+
+    HANDLE hWaitEvent = NULL;
+    EnterCriticalSection(&g_hook_cs);
+
+    if (!g_shm_ptr && !open_shm_locked()) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
 
     HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+    if (hdr->magic != 0x48443344 || !hdr->hook_active) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
 
     /* Wait for a new frame if requested */
     if (hdr->producer_seq == g_last_seq && timeout_ms > 0 && g_frame_event) {
-        ResetEvent(g_frame_event);
-        /* Double-check after reset to avoid race */
-        if (hdr->producer_seq == g_last_seq) {
-            WaitForSingleObject(g_frame_event, timeout_ms);
+        hWaitEvent = g_frame_event;
+        ResetEvent(hWaitEvent);
+    }
+    LeaveCriticalSection(&g_hook_cs);
+
+    /* Wait OUTSIDE the critical section so close_shm can run or other threads aren't blocked */
+    if (hWaitEvent) {
+        WaitForSingleObject(hWaitEvent, timeout_ms);
+    }
+
+    /* Re-acquire critical section to inspect and copy frame safely */
+    EnterCriticalSection(&g_hook_cs);
+
+    /* Verify shared memory is still mapped and valid */
+    if (!g_shm_ptr) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
+
+    /* Re-verify process is still alive */
+    if (g_injected_proc) {
+        DWORD code = 0;
+        if (GetExitCodeProcess(g_injected_proc, &code) && code != STILL_ACTIVE) {
+            agent_log("d3d9hook: injected process PID %lu exited during frame wait (code=%lu)",
+                      (unsigned long)g_injected_pid, (unsigned long)code);
+            close_shm_locked();
+            CloseHandle(g_injected_proc);
+            g_injected_proc = NULL;
+            g_injected_pid = 0;
+            g_remote_dll_base = NULL;
+            LeaveCriticalSection(&g_hook_cs);
+            return 0;
         }
+    }
+
+    hdr = (HookShmHeader *)g_shm_ptr;
+    if (hdr->magic != 0x48443344 || !hdr->hook_active) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
     }
 
     /* Check for new frame */
     uint32_t seq = hdr->producer_seq;
-    if (seq == g_last_seq) return 0;
+    if (seq == g_last_seq) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
 
     /* Read frame data */
     _ReadWriteBarrier();
@@ -341,8 +429,10 @@ int d3d9hook_read_frame(uint8_t *pixels, uint32_t *width, uint32_t *height,
     uint32_t h = hdr->height;
     uint32_t data_size = hdr->data_size;
 
-    if (w == 0 || h == 0 || data_size == 0) return 0;
-    if (data_size > HOOK_SHM_MAX_FRAME) return 0;
+    if (w == 0 || h == 0 || data_size == 0 || data_size > HOOK_SHM_MAX_FRAME) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
 
     uint8_t *src = (uint8_t *)g_shm_ptr + HOOK_SHM_HEADER_SIZE;
     memcpy(pixels, src, data_size);
@@ -356,16 +446,28 @@ int d3d9hook_read_frame(uint8_t *pixels, uint32_t *width, uint32_t *height,
     hdr->consumer_seq = seq;
     if (g_ack_event) SetEvent(g_ack_event);
 
+    LeaveCriticalSection(&g_hook_cs);
     return 1;
 }
 
 int d3d9hook_get_dimensions(uint32_t *width, uint32_t *height) {
-    if (!g_shm_ptr && !open_shm()) return 0;
+    if (!g_hook_cs_inited) return 0;
+    EnterCriticalSection(&g_hook_cs);
+
+    if (!g_shm_ptr && !open_shm_locked()) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
 
     HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
-    if (hdr->magic != 0x48443344) return 0;
+    if (hdr->magic != 0x48443344) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
 
     *width  = hdr->width;
     *height = hdr->height;
-    return (*width > 0 && *height > 0);
+    int valid = (*width > 0 && *height > 0);
+    LeaveCriticalSection(&g_hook_cs);
+    return valid;
 }

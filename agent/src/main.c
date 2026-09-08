@@ -93,11 +93,22 @@ static HWND create_message_window(HINSTANCE hInstance) {
     return CreateWindowA("xpdash_agent_wnd", "xpdash_agent", 0, 0, 0, 0, 0,
                          HWND_MESSAGE, NULL, hInstance, NULL);
 }
+static LONG WINAPI agent_exception_filter(PEXCEPTION_POINTERS ep) {
+    if (ep && ep->ExceptionRecord) {
+        agent_log("FATAL: Unhandled exception 0x%08lX at address %p (flags=0x%lx)",
+                  (unsigned long)ep->ExceptionRecord->ExceptionCode,
+                  ep->ExceptionRecord->ExceptionAddress,
+                  (unsigned long)ep->ExceptionRecord->ExceptionFlags);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
 
     agent_log("=== xpdash-agent starting ===");
+    SetUnhandledExceptionFilter(agent_exception_filter);
     timeBeginPeriod(1);
     g_hwnd = create_message_window(hInstance);
     agent_log("create_message_window: hwnd=%p", g_hwnd);
