@@ -10,9 +10,13 @@
 #include <mmsystem.h>
 #include <ddraw.h>
 
+#ifndef CAPTUREBLT
+#define CAPTUREBLT 0x40000000
+#endif
+
 static HMODULE g_h_ddraw = NULL;
 static LPDIRECTDRAW g_pdd = NULL;
-
+static int g_capture_layered = 1; // Default to 1 (CAPTUREBLT) for capturing Rainmeter & transparent windows
 static void vblank_init(void) {
     if (g_pdd) return;
     g_h_ddraw = LoadLibraryA("ddraw.dll");
@@ -355,10 +359,16 @@ int video_init(video_frame_cb callback, void *user_data) {
         return 0;
     }
     agent_log("video_init: TurboJPEG compressor initialized");
+
     if (!g_hdc_mem) {
         agent_log("CreateCompatibleDC failed! err=%lu", GetLastError());
         return 0;
     }
+
+    g_capture_layered = GetPrivateProfileIntA("video", "capture_layered", 1, "C:\\xpdash\\agent.ini");
+    agent_log("video_init: capture_layered=%d (%s)",
+              g_capture_layered,
+              g_capture_layered ? "SRCCOPY | CAPTUREBLT (includes transparent & layered windows)" : "SRCCOPY (legacy)");
 
     int w = GetSystemMetrics(SM_CXSCREEN);
     int h = GetSystemMetrics(SM_CYSCREEN);
@@ -524,13 +534,25 @@ int video_capture(void) {
             dst32[i] = lut[src8[i]];
         }
     } else {
-        if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
-            static int s_logged_blt_fail = 0;
-            if (!s_logged_blt_fail) {
-                agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
-                s_logged_blt_fail = 1;
+        DWORD rop = SRCCOPY;
+        if (g_capture_layered) rop |= CAPTUREBLT;
+
+        if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, rop)) {
+            // Fallback to plain SRCCOPY if CAPTUREBLT failed on an exotic driver
+            if ((rop & CAPTUREBLT) && BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
+                static int s_logged_rop_fb = 0;
+                if (!s_logged_rop_fb) {
+                    agent_log("video_capture: CAPTUREBLT failed, falling back to plain SRCCOPY");
+                    s_logged_rop_fb = 1;
+                }
+            } else {
+                static int s_logged_blt_fail = 0;
+                if (!s_logged_blt_fail) {
+                    agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
+                    s_logged_blt_fail = 1;
+                }
+                return 0;
             }
-            return 0;
         }
     }
 
