@@ -80,11 +80,10 @@ Designed specifically for period-correct retro gaming rigs (e.g. `timemachine` i
 ### Step 3: In-Stream Controls & Hotkeys
 
 - **`F10`** (or hover cursor within 16px of top edge): Open/close the slide-down **In-Game HUD** overlay with live telemetry (FPS counter, RTT latency, bitrate, audio jitter), audio volume slider, mute toggle, mouse sensitivity slider, and aspect-ratio scaling modes.
-- **`F12`**: Toggle mouse pointer lock (Confined / Unconfined).
+- **`F12`**: Toggle mouse pointer lock (Confined / Unconfined). Clicking inside the stream viewport also confines the pointer.
+- **`Escape`** (or **`F12`**): Release captured mouse cursor to host.
 - **`F9`**: Toggle OBS 1x Fixed Source Mode on/off.
 - **`F11`**: Toggle Fullscreen.
-- **`Right-Ctrl`**: Release captured mouse cursor to host.
-- In HUD: Click **`Send Ctrl+Alt+Del`** to unlock Windows XP or open Task Manager.
 
 ---
 ## OBS Studio Guide: Virtual Capture Card Mode

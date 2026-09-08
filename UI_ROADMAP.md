@@ -42,7 +42,8 @@ flowchart TD
 
     subgraph Network [LAN Transport]
         UDP_Media[UDP 7021 - 60fps Video & 48kHz Audio]
-        TCP_Ctrl[TCP 7020 - Framing, Ping/Pong, Input Events]
+        UDP_Input[UDP 7021 - High-Frequency Input 0x04]
+        TCP_Ctrl[TCP 7020 - Framing, Ping/Pong, TCP Fallback]
         UDP_Beacon[UDP 7022 - Discovery Beacons]
     end
 
@@ -50,13 +51,15 @@ flowchart TD
         AgentNet[net.c TCP/UDP Engine]
         InputInj[input.c SendInput Scancode Injector]
         AudioCap[audio.c What U Hear waveIn]
-        VideoCap[video.c DIBSection & fast LZ4]
+        VideoCap[video.c DIBSection / VSync / D3D9 Hook / TurboJPEG]
     end
 
     RawInput --> InputMgr
     KeyHook --> InputMgr
-    InputMgr -- "OP_INPUT_EVENT (dx, dy, scancode)" --> TCP_Ctrl
-    TCP_Ctrl --> InputInj
+    InputMgr -- "PKT_TYPE_INPUT 0x04 (dx, dy, scancode)" --> UDP_Input
+    InputMgr -- "Fallback OP_INPUT_EVENT" --> TCP_Ctrl
+    UDP_Input --> AgentNet
+    AgentNet --> InputInj
     Dashboard -- "Discover" --> UDP_Beacon
     Dashboard -- "Connect" --> TCP_Ctrl
     UDP_Media --> Viewport
@@ -97,54 +100,31 @@ The launch screen when opening `xpdash`:
   - `CRT Scanline Shader`: Configurable scanline intensity (0–100%), aperture grille shadow mask, and slight barrel curvature simulating a Sony Trinitron CRT.
 
 ### 3.3 Slide-Down In-Game HUD
-Activated by hovering the top 10 pixels of the window or pressing `F10`:
+Activated by hovering the top 16 pixels of the window or pressing `F10`:
 - **Live Stream Diagnostics Bar**:
-  - Real-time glass-to-glass latency estimate ($RTT / 2 + Buffer$).
+  - Real-time glass-to-glass latency estimate ($RTT / 2 + 10\text{ms}$).
   - Current Video FPS (e.g. `60.0 FPS`), compression ratio, and instantaneous bitrate (`Mbps`).
   - Audio jitter buffer health (e.g. `10ms buffer, 0 underruns, ±1.2ms jitter`).
-- **Quick Action Bar**:
-  - `Pointer Lock Toggle`: Visual switch (`Confined [Right-Ctrl]`).
-  - `Audio Volume Slider` (0% to 150% boost) & Mute button.
+- **Quick Action Controls**:
+  - `Pointer Lock Toggle`: Visual switch (`Confined [F12]`, release via `Escape`).
+  - `Audio Volume Slider`: 0% to 150% boost with Mute toggle.
+  - `Mouse Sensitivity Slider`: Fine-tune cursor sensitivity (0.1x to 3.0x).
+  - `Aspect Ratio Selector`: Fit 4:3 (Pillared), Integer 1x, Integer 2x, Bilinear Stretch.
+  - `OBS 1x Mode Toggle`: `F9` toggle for virtual capture card mode with 1:1 window sizing.
   - `Send Ctrl+Alt+Del`: Dedicated one-click trigger sending the security attention sequence to XP.
   - `Display Mode`: Quick toggle between Fullscreen (`F11`), Borderless, and Windowed.
-  - `Disconnect`: Clean TCP session termination.
-
----
-
-## 4. Input Confinement & Modifier Key Routing Subsystem
-
-### 4.1 Pointer Confinement (Game vs. Desktop Mode)
-
-| Mode | Trigger | Mouse Behavior | Coordinate System | Intended Use |
-|---|---|---|---|---|
-| **Desktop / Unconfined** | Default; toggled via `Right-Ctrl` | Host cursor visible; moves freely across host desktop and window borders. | Absolute screen coordinates mapped to XP desktop ($0..65535$). | Menus, file management, launcher tools, strategy games. |
-| **Game / Confined (Locked)** | Click inside window or press `Right-Ctrl` | Host cursor grabbed and hidden (`CursorGrabMode::Locked`). Window borders glow amber. | Raw relative hardware motion deltas ($\Delta X, \Delta Y$). | 3D games (FPS, flight sims, racing) requiring continuous camera rotation. |
-
-- **Confinement Release Hotkey**:
-  - Default: **Right Control** (established standard in QEMU, VirtualBox, VMware).
-  - Alternate user-configurable presets: `Scroll Lock`, `Ctrl + Alt + Z`, or `F12`.
-  - Visual indicator: Subtle 2-pixel ambient border around the viewport (cyan = released, amber = captured).
+  - `Disconnect`: Clean TCP session termination returning to discovery dashboard.
 
 ### 4.2 Granular Modifier Interception Matrix
+| Mode | Trigger | Mouse Behavior | Coordinate System | Intended Use |
+|---|---|---|---|---|
+| **Desktop / Unconfined** | Default; toggled via `F12` or `Escape` | Host cursor visible; moves freely across host desktop and window borders. | Absolute screen coordinates mapped to XP desktop ($0..65535$). | Menus, file management, launcher tools, strategy games. |
+| **Game / Confined (Locked)** | Click inside window or press `F12` | Host cursor grabbed and hidden (`CursorGrabMode::Locked`). Window borders glow amber. | Raw relative hardware motion deltas ($\Delta X, \Delta Y$) via `Event::DeviceEvent` and `Event::MouseMoved`. | 3D games (FPS, flight sims, racing) requiring continuous camera rotation (e.g. GTA San Andreas). |
 
-The settings panel provides independent toggles for system-intercepted keys:
-
-```
-[ Input Routing Preferences ]
-[X] Capture Windows / Super Key     (Opens Windows XP Start Menu instead of Host menu)
-[X] Capture Alt + Tab               (Cycles taskbar windows inside Windows XP)
-[X] Capture Alt + F4                (Closes active XP application instead of xpdash)
-[X] Capture PrintScreen             (Sends keypress to XP for in-game screenshot tools)
-[ ] Enable Host Passthrough Hotkey  (Double-tap Shift to temporarily release input)
-```
-
-- **Implementation Mechanism**:
-  - **Windows Host**: Installs low-level keyboard hook via `SetWindowsHookEx(WH_KEYBOARD_LL)`. When client has focus and input is captured, hooks consume `VK_LWIN`, `VK_RWIN`, `VK_TAB` (with Alt down), and `VK_F4` (with Alt down), converting them into raw PS/2 scancodes sent over TCP while returning `1` to Windows to suppress host actions.
-  - **Linux Host (X11)**: Uses `XGrabKeyboard` / `XGrabPointer` while window is in confined mode.
-  - **Linux Host (Wayland)**: Leverages `zwp_keyboard_shortcuts_inhibit_v1` (Wayland shortcut inhibitor protocol supported by GNOME and KDE) and `zwp_pointer_constraints_v1` for pointer locking.
-
-### 4.3 Authentic Hardware Scancode Mapping (DirectInput Compatibility)
-Modern Windows/Linux keyboards send USB HID usages; legacy DirectX games (DirectInput 8/9) read hardware PS/2 scan codes. The input engine includes a hardware scancode translation table:
+- **Confinement Release Hotkey**:
+  - Default: **`Escape`** or **`F12`**.
+  - Visual indicator: Subtle 2-pixel ambient border around the viewport (cyan = released, amber = captured).
+  - Windows Cursor Lock Compatibility: Handles both raw `DeviceEvent` and `Event::MouseMoved` delta tracking when host OS confines cursor within window bounds.
 
 ```rust
 // PS/2 Set 1 Scancodes for legacy DirectX games
@@ -212,23 +192,25 @@ For headless rigs or networked XP machines:
 
 ---
 
-## 6. Multi-Session Implementation Roadmap (Sessions 6 to 10)
+## 6. Multi-Session Implementation Roadmap (Sessions 6 to 11)
 
-| Session | Focus Area | Key Deliverables | Validation Target |
-|---|---|---|---|
-| **Session 6** | **Native GUI Framework & Dashboard** | Integration of `egui` + `wgpu` into `xpdash-client`, Auto-discovery machine grid, live latency/health badges, zero-copy texture presentation. | Launch client, auto-discover `timemachine`, see 60 fps live preview in GUI window. |
-| **Session 7** | **Input Confinement & Modifier Routing** | Mouse pointer lock (`Right-Ctrl` toggle), low-level keyboard hook / Wayland shortcut inhibitor, Win-Key and Alt+Tab capture toggles, PS/2 scancode injection. | Play GTA San Andreas with 360° mouse rotation, Alt+Tab within XP, Win key opening XP Start Menu. |
-| **Session 8** | **In-Game HUD, Audio Mixer & Retro Shaders** | Slide-down top HUD drawer, real-time RTT/FPS/jitter telemetry overlay, volume slider with VU meter, CRT scanline & integer scaling shaders. | Toggle CRT scanlines at 800x600, view live diagnostics HUD, adjust audio volume on the fly. |
-| **Session 9** | **Remote Deployer Wizard & Standalone Packaging** | In-app SMB/WMI deployment dialog, standalone XP NSIS installer, portable Linux AppImage and Windows single `.exe` bundle. | One-click deploy to fresh XP machine, install via setup package, verify firewall and service persistence. |
-| **Session 10** | **Web Client Gateway (Browser Access)** | WebSocket proxy gateway (`host/crates/xpdash-web`), WebCodecs video decompressor, WebAudio 48kHz PCM output. | Stream and play Windows XP retro games inside Chrome/Firefox over LAN with zero local installs. |
+| Session | Focus Area | Status | Key Deliverables | Validation Target |
+|---|---|---|---|---|
+| **Session 6** | **Native GUI Framework & Dashboard** | **COMPLETED** | Integration of `egui 0.31` + `eframe` (`wgpu`/`winit`) into `xpdash-client`, Auto-discovery machine grid, live latency/health badges, zero-copy texture presentation. | Launch client, auto-discover `timemachine`, see 60 fps live preview in GUI window. |
+| **Session 7** | **Streaming Engine Overhaul (Moonlight-Grade)** | **COMPLETED** | D3D9 hook (`xpdash-hook.dll`), TurboJPEG SIMD encoding (quality 85), high-frequency UDP input (125–1000 Hz), frame pacing decoupling (`vsync: false`), 8-bit paletted adaptation. | Zero-flicker GTA San Andreas at 60 FPS, < 60 Mbps bandwidth, sub-millisecond control latency. |
+| **Session 8** | **Input Confinement & Modifier Routing** | **COMPLETED** | Mouse pointer lock (`F12` / `Escape`), raw relative delta tracking, PS/2 Set 1 hardware scancode translation table, Send `Ctrl+Alt+Del` trigger. | Play GTA San Andreas with 360° mouse rotation, Alt+Tab within XP, Win key opening XP Start Menu. |
+| **Session 9** | **In-Game HUD, Audio Controls & Retro Shaders** | **COMPLETED** | Slide-down top HUD drawer (`F10`), real-time RTT/FPS/jitter telemetry overlay, volume slider with VU meter, CRT scanline & integer scaling shaders, OBS 1x fixed mode (`F9`). | Toggle CRT scanlines at 800x600, view live diagnostics HUD, adjust audio volume on the fly. |
+| **Session 10** | **Remote Deployer Wizard & Standalone Packaging** | *In Progress* | In-app SMB/WMI deployment dialog, standalone XP installer (`install-agent.bat`), release packaging script (`scripts/package-release.sh`), and GitHub Actions release workflow. | One-click deploy to fresh XP machine, install via setup package, verify firewall and service persistence. |
+| **Session 11** | **Web Client Gateway (Browser Access)** | *Pending* | WebSocket proxy gateway (`host/crates/xpdash-web`), WebCodecs video decompressor, WebAudio 48kHz PCM output. | Stream and play Windows XP retro games inside Chrome/Firefox over LAN with zero local installs. |
 
 ---
 
-## 7. Immediate Next Steps: Session 6 Preparation
-1. Add `egui`, `egui-wgpu`, and `winit` dependencies to `host/crates/xpdash-client/Cargo.toml`.
-2. Scaffold `host/crates/xpdash-client/src/ui/` containing:
-   - `dashboard.rs`: Machine grid and status cards.
-   - `viewport.rs`: wgpu texture presentation surface.
-   - `input_handler.rs`: Mouse capture and key routing.
-   - `hud.rs`: Slide-down overlay and metrics display.
-3. Wire discovery beacon listener into UI state to dynamically populate discovered rigs.
+## 7. Current Project Status & Immediate Next Steps
+1. **Completed Core Subsystems**:
+   - Cross-platform native client with `eframe` / `egui` (`host/crates/xpdash-client/src/ui/` containing `dashboard.rs`, `viewport.rs`, `hud.rs`, `input_handler.rs`, and `app.rs`).
+   - High-frequency UDP input injection on port 7021 and reliable TCP control on port 7020.
+   - In-game slide-down HUD (`F10`), OBS 1x source mode (`F9`), 4 aspect-ratio scaling modes.
+   - Release packaging automation (`scripts/package-release.sh`, `.github/workflows/release.yml`).
+2. **Next Milestone Priorities**:
+   - In-app GUI Remote Deployer Wizard (Session 10 GUI dialog calling SMB/WMI staging).
+   - Optional Web Client Gateway (`xpdash-web`) for zero-install browser access.

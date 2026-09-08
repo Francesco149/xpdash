@@ -18,11 +18,12 @@ xpdash connects modern workstations (Linux / Windows) to vintage Windows XP gami
 │       ▼                                                │
 │   "What U Hear" Mixer MUX (LineID 0x00010001)          │
 │       │                                                │
-│   xpdash-agent.exe                                     │
+│   xpdash-agent.exe & xpdash-hook.dll                   │
 │   ├── Audio: waveIn 48kHz 16-bit Stereo PCM (10ms)     │
-│   ├── Video: DIBSection Screen Capture (60 FPS)        │
+│   ├── Video: DIBSection / DirectDraw VSync / D3D9 Hook │
+│   ├── Encode: TurboJPEG SIMD (85) / Fast LZ4 Fallback  │
 │   ├── Input: SendInput (DirectX Hardware Scancodes)    │
-│   └── Network: UDP/TCP Packet Framer (PTS Timestamps)  │
+│   └── Network: UDP Media/Input (7021), TCP Ctrl (7020) │
 └───────────────────────────┬────────────────────────────┘
                             │ LAN (Gigabit / 100M Ethernet)
                             │ Audio/Video UDP (Port 7021)
@@ -33,10 +34,11 @@ xpdash connects modern workstations (Linux / Windows) to vintage Windows XP gami
 │                                                        │
 │   xpdash-client / xpdash-server (Rust)                 │
 │   ├── LAN Discovery Beacon (UDP 7022)                  │
-│   ├── Anti-Desync Demuxer (PTS Comparison)             │
+│   ├── Anti-Desync Demuxer (PTS Monotonic Clock)        │
 │   ├── Audio Output: cpal bounded jitter ring (10ms)    │
-│   ├── Video Output: wgpu / OpenGL texture view         │
-│   ├── Input Forwarder: Relative mouse capture + keys   │
+│   ├── Video Output: egui / wgpu texture surface        │
+│   ├── In-Game HUD: Slide-down F10 telemetry & OBS 1x   │
+│   ├── Input Forwarder: Relative pointer lock + UDP     │
 │   └── (Optional) Web Client Gateway (WS / WebCodecs)   │
 └────────────────────────────────────────────────────────┘
 ```
@@ -71,18 +73,17 @@ If `"What U Hear"` is not selected, the agent programmatically activates it via 
 ## 3. Video Pipeline & Dynamic Resolution Adaptation
 
 ### 3.1 Framebuffer Capture
-1. **GDI DIBSection Capture (Desktop & 2D)**:
+1. **GDI DIBSection & DirectDraw VSync Capture (Desktop, 2D & Fallback)**:
    - `CreateCompatibleDC(NULL)` + `CreateDIBSection()` with a shared memory buffer.
+   - DirectDraw hardware VSync synchronization (`WaitForVerticalBlank` with `DDWAITVB_BLOCKBEGIN` via `IDirectDraw` in `ddraw.dll`) synchronizes desktop capture to the display refresh cycle, preventing torn frames.
    - `BitBlt()` with `SRCCOPY | CAPTUREBLT` (0x40CC0020) captures the desktop surface at up to 60 FPS, including `WS_EX_LAYERED` transparent windows (Rainmeter widgets, alpha-blended overlays).
-   - Zero-copy access to raw 32-bit BGRX pixel data for TurboJPEG encoding.
+   - **8-Bit Paletted & Dynamic Color Depth Adaptation**: When running 8-bit paletted retro games (e.g. *StarCraft*, *Diablo II*, *Fallout*), the agent detects paletted mode via `GetDeviceCaps(hdc, BITSPIXEL)` and `RASTERCAPS & RC_PALETTE`. It creates an 8-bit DIBSection, captures raw palette indices, extracts the active 256-entry DAC palette table via `GetSystemPaletteEntries`, and expands indices to 32-bit BGRX before TurboJPEG compression.
+   - **Hardware Cursor Compositing**: Because GDI `BitBlt` does not include the hardware cursor, the agent queries cursor state via `GetCursorInfo()`. If `CURSOR_SHOWING` is active, it composites the cursor icon with proper hotspot coordinates directly onto the frame. Fullscreen games that hide the mouse cursor (e.g. GTA San Andreas gameplay) clear `CURSOR_SHOWING`, automatically suppressing cursor overlay.
    - *Hardware Video Overlay limitation*: Pre-rendered MPEG videos decoded via legacy DirectShow hardware overlays render directly to an offscreen YUV overlay plane on the GPU while painting the desktop window with the GPU's overlay color key (`RGB(16, 0, 16)`). Desktop captures see only this color key unless hardware overlays are disabled (e.g. in Windows Media Player options or DirectX troubleshooter), prompting DirectShow to use VMR-7/9 software blitting. In-game 3D cutscenes are rendered via Direct3D 9 and captured via the D3D9 hook with zero issues.
 2. **Direct3D 9 Backbuffer Hook (3D Gaming)**:
-   - Injected hook DLL intercepts `IDirect3DDevice9::Present()` and reads the backbuffer directly via `GetRenderTargetData` to shared memory, completely eliminating mid-render tearing and flicker.
-3. **Dirty-Tile Detection**:
-   - The desktop is subdivided into 64×64 pixel tiles.
-   - A fast 64-bit hash or delta comparison flags changed tiles.
-   - For desktop productivity, only modified tiles are compressed and transmitted.
-   - For fast 3D gaming, full frames are streamed with motion-optimized quantization.
+   - Injected hook DLL (`xpdash-hook.dll`) intercepts `IDirect3DDevice9::Present()` (vtable index 17), `EndScene()` (index 42), and `Reset()` (index 16).
+   - Reads backbuffer directly via `GetRenderTargetData` to offscreen system memory, writing frames to a named shared memory section (`CreateFileMapping`) and signaling an event (`SetEvent`).
+   - The agent's video thread reads from shared memory when the hook is active, completely eliminating mid-render tearing and flicker.
 
 ### 3.2 Dynamic Resolution Change (`WM_DISPLAYCHANGE`)
 Older remote desktop tools crash or render garbled pixels when retro games switch resolutions (e.g. 1024×768 desktop switching to 640×480 in-game).
@@ -123,18 +124,22 @@ Communication uses two ports:
    - Client authentication and fingerprint verification.
    - Resolution change notifications.
    - Input injection events (keystrokes and mouse packets).
-2. **UDP Port 7021 (Media Stream)**:
-   - Packetized audio (10ms chunks) and video frames/tiles.
-   - Lightweight 12-byte header:
+2. **UDP Port 7021 (Media Stream & High-Frequency Input)**:
+   - Packetized audio (10ms chunks) and video frames/chunks (Agent → Client).
+   - High-frequency input event datagrams (Client → Agent) for 125–1000 Hz mouse deltas.
+   - Lightweight 16-byte header:
      ```
      [u8 magic: 0x58 'X']
-     [u8 type: 0x01 Video | 0x02 Audio | 0x03 Ping]
-     [u16 flags]
+     [u8 type: 0x01 Video | 0x02 Audio | 0x03 Ping | 0x04 Input]
+     [u16 flags (bit 0 = keyframe)]
      [u32 seq]
      [u32 pts_ms]
      [u16 payload_len]
+     [u16 reserved]
      [raw payload bytes]
      ```
+   - Ultra-low-latency 10-byte input datagram: `[Magic: 0x58][Type: 0x04][MsgInputEvent: 8 bytes]`.
+   - Video codecs: `VIDEO_CODEC_JPEG` (0x01, TurboJPEG quality 85, default), `VIDEO_CODEC_LZ4` (0x02, fallback lossless).
 3. **UDP Port 7022 (Discovery)**:
    - Host server broadcasts periodic beacon `XPDASH_BEACON`.
    - XP agent listens and connects upon beacon detection.

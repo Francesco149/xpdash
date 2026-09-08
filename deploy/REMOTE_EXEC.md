@@ -1,6 +1,6 @@
 # Windows XP Remote Execution & SMB Gotchas Guide
 
-This document records the exact mechanics, gotchas, and working command patterns for interacting with Windows XP target machines (e.g. `timemachine` at `10.0.10.113`, `q9650` at `10.0.10.114`) over LAN.
+This document records the exact mechanics, gotchas, and working command patterns for interacting with Windows XP target machines (e.g. `timemachine` at `10.0.10.113`, `q9650` at `10.0.10.134`) over LAN.
 
 ---
 
