@@ -51,7 +51,7 @@ impl DashboardView {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.colored_label(
                             Color32::from_rgb(46, 204, 113),
-                            RichText::new(format!("● LAN Discovery Active ({} Rigs)", rigs.len())).strong(),
+                            RichText::new(format!("🖧 LAN Discovery Active ({} Rigs)", rigs.len())).strong(),
                         );
                     });
                 });
@@ -123,13 +123,27 @@ impl DashboardView {
                 });
         } else {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for rig in &rigs {
-                        if let Some(target) = render_rig_card(ui, rig) {
-                            connect_target = Some(target);
+                let avail_width = ui.available_width();
+                let spacing = 16.0;
+                // Responsive column count: 2 columns if width >= 860px, otherwise 1 column
+                let num_cols = if avail_width >= 860.0 { 2 } else { 1 };
+                let card_width = if num_cols == 1 {
+                    avail_width
+                } else {
+                    ((avail_width - spacing) / 2.0).floor()
+                };
+
+                for chunk in rigs.chunks(num_cols) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = spacing;
+                        for rig in chunk {
+                            if let Some(target) = render_rig_card(ui, rig, card_width) {
+                                connect_target = Some(target);
+                            }
                         }
-                    }
-                });
+                    });
+                    ui.add_space(spacing);
+                }
             });
         }
 
@@ -137,107 +151,110 @@ impl DashboardView {
     }
 }
 
-fn render_rig_card(ui: &mut egui::Ui, rig: &DiscoveredRig) -> Option<String> {
+fn render_rig_card(ui: &mut egui::Ui, rig: &DiscoveredRig, card_width: f32) -> Option<String> {
     let mut connect_target = None;
-    let card_width = 380.0;
 
-    Frame::new()
-        .fill(Color32::from_rgb(20, 25, 32))
-        .stroke(Stroke::new(1.2f32, Color32::from_rgb(45, 55, 68)))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(16))
-        .show(ui, |ui| {
-            ui.set_width(card_width);
+    ui.allocate_ui_with_layout(
+        egui::vec2(card_width, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            Frame::new()
+                .fill(Color32::from_rgb(20, 25, 32))
+                .stroke(Stroke::new(1.2f32, Color32::from_rgb(45, 55, 68)))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(card_width - 32.0);
 
-            // Card Header: Rig Name & Status
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("🖥").size(22.0));
-                ui.vertical(|ui| {
-                    ui.heading(RichText::new(&rig.name).size(17.0).color(Color32::WHITE).strong());
-                    ui.label(
-                        RichText::new(format!("{}:{}", rig.ip, rig.control_port))
-                            .size(12.0)
-                            .color(Color32::from_rgb(130, 145, 165)),
-                    );
-                });
+                    // Card Header: Rig Name & Status
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("🖥").size(22.0));
+                        ui.vertical(|ui| {
+                            ui.heading(RichText::new(&rig.name).size(17.0).color(Color32::WHITE).strong());
+                            ui.label(
+                                RichText::new(format!("{}:{}", rig.ip, rig.control_port))
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(130, 145, 165)),
+                            );
+                        });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match rig.latency_category() {
-                        LatencyBadge::Excellent(ms) => {
-                            ui.colored_label(Color32::from_rgb(46, 204, 113), RichText::new(format!("● {:.2} ms", ms)).strong());
-                        }
-                        LatencyBadge::Good(ms) => {
-                            ui.colored_label(Color32::from_rgb(241, 196, 15), RichText::new(format!("● {:.2} ms", ms)).strong());
-                        }
-                        LatencyBadge::Warning(ms) => {
-                            ui.colored_label(Color32::from_rgb(231, 76, 60), RichText::new(format!("● {:.2} ms", ms)).strong());
-                        }
-                        LatencyBadge::Unknown => {
-                            ui.colored_label(Color32::GRAY, "● Offline");
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            match rig.latency_category() {
+                                LatencyBadge::Excellent(ms) => {
+                                    ui.colored_label(Color32::from_rgb(46, 204, 113), RichText::new(format!("⏱ {:.2} ms", ms)).strong());
+                                }
+                                LatencyBadge::Good(ms) => {
+                                    ui.colored_label(Color32::from_rgb(241, 196, 15), RichText::new(format!("⏱ {:.2} ms", ms)).strong());
+                                }
+                                LatencyBadge::Warning(ms) => {
+                                    ui.colored_label(Color32::from_rgb(231, 76, 60), RichText::new(format!("⏱ {:.2} ms", ms)).strong());
+                                }
+                                LatencyBadge::Unknown => {
+                                    ui.colored_label(Color32::GRAY, "⏱ Offline");
+                                }
+                            }
+                        });
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // Specs Badges (OS and Screen Resolution)
+                    ui.horizontal(|ui| {
+                        render_badge(ui, &rig.os_badge, Color32::from_rgb(30, 80, 160), Color32::WHITE);
+                        render_badge(
+                            ui,
+                            &format!("{}x{}@{}bpp", rig.screen_width, rig.screen_height, rig.bpp),
+                            Color32::from_rgb(40, 50, 65),
+                            Color32::from_rgb(200, 215, 230),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+
+                    // Audio Hardware Badge
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Audio:").size(11.0).color(Color32::from_rgb(130, 145, 160)));
+                        render_badge(
+                            ui,
+                            &rig.audio_badge,
+                            Color32::from_rgb(80, 40, 110),
+                            Color32::from_rgb(230, 190, 255),
+                        );
+                    });
+
+                    ui.add_space(6.0);
+
+                    // Security Status
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Security:").size(11.0).color(Color32::from_rgb(130, 145, 160)));
+                        ui.colored_label(
+                            Color32::from_rgb(46, 204, 113),
+                            RichText::new("🛡 Verified Session").size(11.0).strong(),
+                        );
+                    });
+
+                    ui.add_space(12.0);
+
+                    // Full-width Connect Button
+                    let btn = egui::Button::new(
+                        RichText::new("▶ Connect to Console")
+                            .size(14.0)
+                            .color(Color32::BLACK)
+                            .strong(),
+                    )
+                    .fill(Color32::from_rgb(0, 210, 255))
+                    .corner_radius(CornerRadius::same(5));
+
+                    let btn_width = ui.available_width();
+                    if ui.add_sized([btn_width, 34.0], btn).clicked() {
+                        connect_target = Some(rig.ip.clone());
                     }
                 });
-            });
+        },
+    );
 
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // Specs Badges
-            ui.horizontal(|ui| {
-                // OS Badge
-                render_badge(ui, &rig.os_badge, Color32::from_rgb(30, 80, 160), Color32::WHITE);
-                // Screen Resolution
-                render_badge(
-                    ui,
-                    &format!("{}x{}@{}bpp", rig.screen_width, rig.screen_height, rig.bpp),
-                    Color32::from_rgb(40, 50, 65),
-                    Color32::from_rgb(200, 215, 230),
-                );
-            });
-
-            ui.add_space(6.0);
-
-            // Audio Hardware Badge
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Audio:").size(11.0).color(Color32::from_rgb(130, 145, 160)));
-                render_badge(
-                    ui,
-                    &rig.audio_badge,
-                    Color32::from_rgb(80, 40, 110),
-                    Color32::from_rgb(230, 190, 255),
-                );
-            });
-
-            ui.add_space(6.0);
-
-            // Security Status
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Security:").size(11.0).color(Color32::from_rgb(130, 145, 160)));
-                ui.colored_label(
-                    Color32::from_rgb(46, 204, 113),
-                    RichText::new("🛡 Verified Session").size(11.0).strong(),
-                );
-            });
-
-            ui.add_space(12.0);
-
-            // Connect Button
-            let btn = egui::Button::new(
-                RichText::new("▶ Connect to Console")
-                    .size(14.0)
-                    .color(Color32::BLACK)
-                    .strong(),
-            )
-            .fill(Color32::from_rgb(0, 210, 255))
-            .corner_radius(CornerRadius::same(5));
-
-            if ui.add_sized([card_width - 8.0, 32.0], btn).clicked() {
-                connect_target = Some(rig.ip.clone());
-            }
-        });
-
-    ui.add_space(12.0);
     connect_target
 }
 
@@ -249,4 +266,25 @@ fn render_badge(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(11.0).color(fg).strong());
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ui_icons_exist_in_font() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |_| {});
+        ctx.fonts(|f| {
+            let glyph_unknown = &f.layout_no_wrap("\u{FFFF}".to_string(), egui::FontId::proportional(14.0), Color32::WHITE).rows[0].glyphs[0];
+            let required_icons = vec!['🖧', '⏱', '🖥', '🛡', '•'];
+            for &c in &required_icons {
+                let g = &f.layout_no_wrap(c.to_string(), egui::FontId::proportional(14.0), Color32::WHITE).rows[0].glyphs[0];
+                let is_missing_box = g.uv_rect == glyph_unknown.uv_rect
+                    && (g.advance_width - glyph_unknown.advance_width).abs() < 0.001;
+                assert!(!is_missing_box, "Icon {:?} (U+{:04X}) rendered as missing glyph replacement box!", c, c as u32);
+            }
+        });
+    }
 }

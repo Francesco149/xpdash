@@ -70,7 +70,7 @@ impl HudOverlay {
                             } else {
                                 (Color32::from_rgb(231, 76, 60), format!("{:.2} ms RTT", rtt))
                             };
-                            ui.colored_label(rtt_color, egui::RichText::new(format!("● {}", rtt_text)).strong());
+                            ui.colored_label(rtt_color, egui::RichText::new(format!("⏱ {}", rtt_text)).strong());
 
                             // Glass-to-glass estimate: RTT/2 + 10ms buffer
                             let g2g = (rtt / 2.0) + 10.0;
