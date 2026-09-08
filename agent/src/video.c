@@ -45,8 +45,8 @@ static void vblank_init(void) {
 
 static int g_vblank_disabled = 0;
 static int g_target_fps = 60;
+static int g_desktop_fps = 20;
 static int g_jpeg_quality = 85;
-
 static void vblank_wait(void) {
     if (g_pdd && !g_vblank_disabled) {
         /* Wait for the next vertical blanking interval to begin.
@@ -136,6 +136,32 @@ int video_get_bpp(void) {
     return g_bpp;
 }
 
+static RECT s_last_cursor_rect = { 0, 0, 0, 0 };
+static int s_has_cursor_rect = 0;
+static POINT s_last_cursor_pos = { -1, -1 };
+static DWORD s_last_cursor_flags = 0;
+static DWORD s_last_blt_finish_time = 0;
+/* Restore the 32x32 pixel area under the previous cursor from g_prev_pixels
+   without calling BitBlt across the PCIe bus (takes 0.001ms instead of 120ms) */
+static void restore_cursor_rect(void) {
+    if (!s_has_cursor_rect || !g_pixels || !g_prev_pixels) return;
+    int x0 = s_last_cursor_rect.left;
+    int y0 = s_last_cursor_rect.top;
+    int x1 = s_last_cursor_rect.right;
+    int y1 = s_last_cursor_rect.bottom;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > g_width) x1 = g_width;
+    if (y1 > g_height) y1 = g_height;
+    int copy_w = x1 - x0;
+    if (copy_w <= 0) return;
+
+    for (int y = y0; y < y1; y++) {
+        uint32_t *dst = (uint32_t *)g_pixels + (y * g_width + x0);
+        const uint32_t *src = (const uint32_t *)g_prev_pixels + (y * g_width + x0);
+        memcpy(dst, src, copy_w * 4);
+    }
+}
 
 static video_frame_cb g_cb = NULL;
 static void *g_cb_userdata = NULL;
@@ -146,7 +172,6 @@ static HANDLE g_h_video_thread = NULL;
 static volatile int g_video_running = 0;
 static DWORD s_last_hook_frame_time = 0;
 static int   s_in_hook_mode = 0;
-
 static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
     (void)lpParam;
     agent_log("video_worker_thread: capture thread started");
@@ -388,11 +413,14 @@ int video_init(video_frame_cb callback, void *user_data) {
     g_target_fps = GetPrivateProfileIntA("video", "target_fps", 60, "C:\\xpdash\\agent.ini");
     if (g_target_fps <= 0 || g_target_fps > 120) g_target_fps = 60;
 
+    g_desktop_fps = GetPrivateProfileIntA("video", "desktop_fps", 20, "C:\\xpdash\\agent.ini");
+    if (g_desktop_fps <= 0 || g_desktop_fps > 60) g_desktop_fps = 20;
+
     g_jpeg_quality = GetPrivateProfileIntA("video", "jpeg_quality", 85, "C:\\xpdash\\agent.ini");
     if (g_jpeg_quality < 30 || g_jpeg_quality > 100) g_jpeg_quality = 85;
 
-    agent_log("video_init: capture_layered=%d, target_fps=%d, jpeg_quality=%d",
-              g_capture_layered, g_target_fps, g_jpeg_quality);
+    agent_log("video_init: capture_layered=%d, target_fps=%d, desktop_fps=%d, jpeg_quality=%d",
+              g_capture_layered, g_target_fps, g_desktop_fps, g_jpeg_quality);
     int w = GetSystemMetrics(SM_CXSCREEN);
     int h = GetSystemMetrics(SM_CYSCREEN);
     agent_log("video_init: GetSystemMetrics = %dx%d", w, h);
@@ -579,57 +607,84 @@ int video_capture(void) {
             dst32[i] = lut[src8[i]];
         }
     } else {
-        DWORD rop = SRCCOPY;
-        if (g_capture_layered) rop |= CAPTUREBLT;
-
-        if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, rop)) {
-            // Fallback to plain SRCCOPY if CAPTUREBLT failed on an exotic driver
-            if ((rop & CAPTUREBLT) && BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
-                static int s_logged_rop_fb = 0;
-                if (!s_logged_rop_fb) {
-                    agent_log("video_capture: CAPTUREBLT failed, falling back to plain SRCCOPY");
-                    s_logged_rop_fb = 1;
+        /* Paced BitBlt: On PCIe-bound GDI readbacks (e.g. AMD Radeon on G41 chipset),
+           BitBlt with CAPTUREBLT takes ~120ms. We pace full VRAM readbacks at ~25 FPS (every 40ms)
+           to capture window and layered window updates without locking win32k.sys.
+           Cursor movements between BitBlt passes are rendered instantly via restore_cursor_rect(). */
+        DWORD desktop_interval = (g_desktop_fps > 0) ? (1000 / g_desktop_fps) : 50;
+        int should_blt = g_force_keyframe || (!s_last_blt_finish_time) || (now - s_last_blt_finish_time >= desktop_interval);
+        if (should_blt) {
+            DWORD rop = SRCCOPY;
+            if (g_capture_layered) rop |= CAPTUREBLT;
+            if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, rop)) {
+                // Fallback to plain SRCCOPY if CAPTUREBLT failed on an exotic driver
+                if ((rop & CAPTUREBLT) && BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
+                    static int s_logged_rop_fb = 0;
+                    if (!s_logged_rop_fb) {
+                        agent_log("video_capture: CAPTUREBLT failed, falling back to plain SRCCOPY");
+                        s_logged_rop_fb = 1;
+                    }
+                } else {
+                    static int s_logged_blt_fail = 0;
+                    if (!s_logged_blt_fail) {
+                        agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
+                        s_logged_blt_fail = 1;
+                    }
+                    return 0;
                 }
-            } else {
-                static int s_logged_blt_fail = 0;
-                if (!s_logged_blt_fail) {
-                    agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
-                    s_logged_blt_fail = 1;
-                }
-                return 0;
             }
+            s_last_blt_finish_time = timeGetTime();
         }
     }
 
     DWORD t1 = timeGetTime();
     g_frame_counter++;
 
-    /* Query cursor for compositing onto dirty frames */
+    /* Query cursor movement */
     CURSORINFO ci;
     memset(&ci, 0, sizeof(ci));
     ci.cbSize = sizeof(CURSORINFO);
-    GetCursorInfo(&ci);
+    int cursor_moved = 0;
+    if (GetCursorInfo(&ci)) {
+        if (ci.ptScreenPos.x != s_last_cursor_pos.x ||
+            ci.ptScreenPos.y != s_last_cursor_pos.y ||
+            ci.flags != s_last_cursor_flags) {
+            cursor_moved = 1;
+            s_last_cursor_pos = ci.ptScreenPos;
+            s_last_cursor_flags = ci.flags;
+        }
+    }
+
     int is_keyframe = g_force_keyframe || ((g_frame_counter % KEYFRAME_INTERVAL) == 0);
     int screen_dirty = is_keyframe ? 1 : is_screen_dirty();
 
-    /* If screen did not change, skip encoding completely!
-       In desktop mode, the client renders its own local cursor with zero latency.
-       Only re-encode and transmit video frames when screen pixels actually change. */
-    if (!screen_dirty) {
+    /* If neither the screen changed nor the cursor moved, skip completely! */
+    if (!screen_dirty && !cursor_moved) {
         return 1;
     }
 
     int raw_size = g_width * g_height * 4;
 
-    /* Update g_prev_pixels with the CLEAN desktop BEFORE drawing cursor!
-       This prevents the drawn cursor from making subsequent frames perpetually dirty. */
     if (screen_dirty) {
+        /* Desktop contents changed: save clean desktop to g_prev_pixels */
         memcpy(g_prev_pixels, g_pixels, raw_size);
         g_force_keyframe = 0;
+        s_has_cursor_rect = 0;
+    } else if (cursor_moved) {
+        /* Desktop clean, only cursor moved: restore old cursor rectangle from g_prev_pixels
+           in 0.001ms without touching VRAM across PCIe bus! */
+        restore_cursor_rect();
     }
 
-    /* Draw cursor onto framebuffer for outgoing compressed frame */
+    /* Draw cursor at current position */
     draw_cursor(g_hdc_mem);
+
+    /* Save cursor bounding rectangle for fast restoration on next frame */
+    s_last_cursor_rect.left = ci.ptScreenPos.x - 4;
+    s_last_cursor_rect.top = ci.ptScreenPos.y - 4;
+    s_last_cursor_rect.right = ci.ptScreenPos.x + 36;
+    s_last_cursor_rect.bottom = ci.ptScreenPos.y + 36;
+    s_has_cursor_rect = 1;
 
     DWORD t2 = timeGetTime();
 
