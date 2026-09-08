@@ -1,0 +1,141 @@
+name: Nightly Release
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-and-agent:
+    name: Build Linux Client & XP Agent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install System & MinGW Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-mingw-w64-i686 \
+            binutils-mingw-w64-i686 \
+            libasound2-dev \
+            libudev-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxkbcommon-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            zip
+
+      - name: Package Standalone Linux & Windows XP Bundles
+        run: |
+          bash scripts/package-release.sh
+
+      - name: Upload Linux Client Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpdash-linux-x86_64
+          path: dist/xpdash-linux-x86_64.tar.gz
+
+      - name: Upload Windows XP Agent Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpdash-agent-winxp
+          path: dist/xpdash-agent-winxp.zip
+
+  build-windows-client:
+    name: Build Windows 10/11 Client
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows Client Release
+        run: |
+          cargo build --manifest-path host/Cargo.toml --release --bin xpdash-client
+
+      - name: Package Windows Client Bundle
+        shell: bash
+        run: |
+          mkdir -p dist/xpdash-client-windows-x86_64
+          cp host/target/release/xpdash-client.exe dist/xpdash-client-windows-x86_64/
+          cp LICENSE dist/xpdash-client-windows-x86_64/
+          cat << 'EOF' > dist/xpdash-client-windows-x86_64/run-client.bat
+          @echo off
+          start "" "%~dp0xpdash-client.exe" %*
+          EOF
+          cat << 'EOF' > dist/xpdash-client-windows-x86_64/run-obs.bat
+          @echo off
+          start "" "%~dp0xpdash-client.exe" --obs %*
+          EOF
+          (cd dist && 7z a -tzip xpdash-client-windows-x86_64.zip xpdash-client-windows-x86_64)
+
+      - name: Upload Windows Client Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpdash-client-windows-x86_64
+          path: dist/xpdash-client-windows-x86_64.zip
+
+  publish-nightly:
+    name: Publish Nightly Release
+    needs: [build-linux-and-agent, build-windows-client]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p final-dist
+          cp release-artifacts/xpdash-linux-x86_64/xpdash-linux-x86_64.tar.gz final-dist/
+          cp release-artifacts/xpdash-agent-winxp/xpdash-agent-winxp.zip final-dist/
+          cp release-artifacts/xpdash-client-windows-x86_64/xpdash-client-windows-x86_64.zip final-dist/
+          ls -lh final-dist/
+
+      - name: Bump Nightly Tag and Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          COMMIT_DATE=$(git log -1 --format=%cd --date=short ${{ github.sha }})
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly ${{ github.sha }}
+          git push -f origin nightly
+
+          gh release delete nightly --yes 2>/dev/null || true
+
+          gh release create nightly final-dist/* \
+            --title "xpdash Nightly ($COMMIT_DATE - $SHORT_SHA)" \
+            --notes "Automated nightly release built from commit [${SHORT_SHA}](https://github.com/${{ github.repository }}/commit/${{ github.sha }}).
+
+          ### Standalone Release Bundles:
+          - **\`xpdash-linux-x86_64.tar.gz\`**: Linux 64-bit client (\`xpdash-client\`) & server (\`xpdash-server\`) with launcher scripts
+          - **\`xpdash-client-windows-x86_64.zip\`**: Windows 10/11 64-bit client with OBS virtual capture card mode (\`run-obs.bat\`)
+          - **\`xpdash-agent-winxp.zip\`**: Windows XP agent (\`xpdash-agent.exe\`), hook DLLs, auto-installers, and complete graphics/audio test suite" \
+            --prerelease \
+            --clobber

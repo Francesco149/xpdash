@@ -5,6 +5,7 @@ dist/
 *.exe
 *.o
 *.a
+!agent/lib/libturbojpeg.a
 *.dll
 *.log
 *.out

@@ -20,9 +20,13 @@ cargo build --manifest-path host/Cargo.toml --release --bin xpdash-client --bin 
 # 2. Build Windows XP Agent and All Test Tools
 echo ""
 echo "[2/4] Building Windows XP agent and tools suite with MinGW subsystem 5.1..."
-nix develop -c bash agent/build.sh
-nix develop -c bash tools/build-all.sh
-
+if command -v nix >/dev/null 2>&1 && [ -f flake.nix ]; then
+    nix develop -c bash agent/build.sh
+    nix develop -c bash tools/build-all.sh
+else
+    bash agent/build.sh
+    bash tools/build-all.sh
+fi
 # 3. Package Linux Standalone Bundle
 echo ""
 echo "[3/4] Creating Linux standalone tarball..."
