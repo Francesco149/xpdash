@@ -375,15 +375,6 @@ static HRESULT WINAPI hook_reset(IDirect3DDevice9 *dev,
              dev, pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0,
              pp ? (unsigned long)pp->PresentationInterval : 0);
 
-    /* Decouple VSync on device reset to prevent 30/20 FPS quantization */
-    if (pp) {
-        if (pp->PresentationInterval == D3DPRESENT_INTERVAL_DEFAULT ||
-            pp->PresentationInterval == D3DPRESENT_INTERVAL_ONE) {
-            hook_log("hook_reset: uncoupling VSync: overriding PresentationInterval from 0x%lx to D3DPRESENT_INTERVAL_IMMEDIATE",
-                     (unsigned long)pp->PresentationInterval);
-            pp->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-        }
-    }
 
     /* Release D3D resources before Reset so D3D9 Reset() doesn't fail with D3DERR_DEVICELOST */
     EnterCriticalSection(&g_cs);
@@ -404,15 +395,6 @@ static HRESULT WINAPI hook_create_device(IDirect3D9 *d3d, UINT Adapter, D3DDEVTY
              pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0,
              pp ? (unsigned long)pp->PresentationInterval : 0);
 
-    /* Decouple VSync on device creation to prevent 30/20 FPS quantization */
-    if (pp) {
-        if (pp->PresentationInterval == D3DPRESENT_INTERVAL_DEFAULT ||
-            pp->PresentationInterval == D3DPRESENT_INTERVAL_ONE) {
-            hook_log("hook_create_device: uncoupling VSync: overriding PresentationInterval from 0x%lx to D3DPRESENT_INTERVAL_IMMEDIATE",
-                     (unsigned long)pp->PresentationInterval);
-            pp->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-        }
-    }
 
     /* Release any surfaces from older devices so the old device is fully freed in COM */
     EnterCriticalSection(&g_cs);
