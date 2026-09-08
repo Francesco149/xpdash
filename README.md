@@ -2,6 +2,9 @@
 
 Ultra-low-latency streaming, audio capture, and remote control for real Windows XP hardware over LAN.
 
+https://github.com/user-attachments/assets/65c0bb59-cce4-4c03-b1ca-d286a464664e
+
+
 Designed specifically for period-correct retro gaming rigs (e.g. `timemachine` i7-4790K + GTX 750 Ti + Sound Blaster Audigy SB0090; `q9650` Core 2 Quad Q9650 + Radeon HD 5770).
 
 > **Project Status & Disclaimer**: *xpdash was literally vibe-coded in 1 day!* While it has been extensively tested and tuned on our physical reference lab rigs (`timemachine` and `q9650`) with sub-millisecond control latencies and zero audio/video drops, it has not yet been battle-tested across the wild ecosystem of retro PC builds, oddball sound cards, or exotic display adapters. Expect edge cases, and please open an issue or PR with your hardware details if you encounter unexpected behavior!
