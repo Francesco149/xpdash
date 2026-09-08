@@ -75,8 +75,8 @@ void input_inject_mouse_abs(uint16_t x, uint16_t y) {
         static float s_accum_dy = 0.0f;
 
         if (s_prev_abs_x >= 0 && s_prev_abs_y >= 0) {
-            float raw_dx = (float)(px - s_prev_abs_x) * 0.10f;
-            float raw_dy = (float)(py - s_prev_abs_y) * 0.10f;
+            float raw_dx = (float)(px - s_prev_abs_x) * 0.25f;
+            float raw_dy = (float)(py - s_prev_abs_y) * 0.25f;
 
             s_accum_dx += raw_dx;
             s_accum_dy += raw_dy;

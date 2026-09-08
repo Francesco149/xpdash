@@ -122,27 +122,26 @@ static tjhandle g_tj = NULL;     /* TurboJPEG compressor instance */
 
 static HANDLE g_h_video_thread = NULL;
 static volatile int g_video_running = 0;
+static DWORD s_last_hook_frame_time = 0;
+static int   s_in_hook_mode = 0;
 
 static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
     (void)lpParam;
-    agent_log("video_worker_thread: capture thread started (VSync-synced)");
+    agent_log("video_worker_thread: capture thread started");
 
     while (g_video_running) {
         if (net_is_streaming_active()) {
-            if (d3d9hook_is_active()) {
-                /* Hook frames are driven by the game's Present() via d3d9hook_read_frame()'s
-                   internal event wait. Do not wait on DirectDraw VBlank here which would cause
-                   aliasing and jitter against the game's internal frame rate. */
-                video_capture();
-            } else {
-                /* GDI BitBlt fallback: wait for hardware VBlank to avoid mid-render tearing */
+            /* If actively receiving D3D9 hook frames, frame rate is driven
+               by Present() via d3d9hook_read_frame's internal event wait.
+               Otherwise, wait for hardware VBlank or sleep 16ms for desktop capture. */
+            if (!s_in_hook_mode) {
                 if (g_pdd) {
                     vblank_wait();
                 } else {
                     Sleep(16);
                 }
-                video_capture();
             }
+            video_capture();
         } else {
             Sleep(50);
         }
@@ -300,6 +299,12 @@ int video_capture(void) {
 
         if (g_pixels && d3d9hook_read_frame(g_pixels, &hook_w, &hook_h,
                                              &hook_idx, 16)) {
+            s_last_hook_frame_time = now;
+            if (!s_in_hook_mode) {
+                s_in_hook_mode = 1;
+                agent_log("video_capture: switched to D3D9 hook stream (%ux%u)", hook_w, hook_h);
+                video_force_keyframe();
+            }
             g_frame_counter = hook_idx;
 
             /* Hook frames are always "dirty" — the hook only fires on Present */
@@ -354,12 +359,34 @@ int video_capture(void) {
             }
             return 1;
         }
-        /* Hook active but no new frame this tick — skip, don't fall through
-           to BitBlt which would produce a flickery frame. */
-        return 1;
+
+        /* If hook was active recently (< 120ms), wait for next Present() */
+        if (s_in_hook_mode && (now - s_last_hook_frame_time < 120)) {
+            return 1;
+        }
+
+        /* Game is minimized, tabbed out, or paused — fall through to Path B (BitBlt)
+           so the desktop stream continues seamlessly! */
+        if (s_in_hook_mode) {
+            s_in_hook_mode = 0;
+            agent_log("video_capture: hook idle (%lums), falling back to desktop BitBlt",
+                      (unsigned long)(now - s_last_hook_frame_time));
+            video_force_keyframe();
+        }
+    } else {
+        if (s_in_hook_mode) {
+            s_in_hook_mode = 0;
+            video_force_keyframe();
+        }
     }
 
     /* ── Path B: GDI BitBlt capture (fallback for desktop / non-D3D) ─ */
+    int screen_w = GetSystemMetrics(SM_CXSCREEN);
+    int screen_h = GetSystemMetrics(SM_CYSCREEN);
+    if (screen_w > 0 && screen_h > 0 && (g_width != screen_w || g_height != screen_h)) {
+        video_resize(screen_w, screen_h);
+    }
+
     if (!g_hdc_screen || !g_hdc_mem || !g_pixels || !g_comp_buf) {
         static int s_logged_null = 0;
         if (!s_logged_null) {

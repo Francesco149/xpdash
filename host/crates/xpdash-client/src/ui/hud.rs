@@ -143,7 +143,7 @@ impl HudOverlay {
                             // In-Game Mouse Sensitivity Slider
                             ui.label("Sens:");
                             let mut sens = input.sensitivity;
-                            if ui.add(egui::Slider::new(&mut sens, 0.005..=0.10).text("").show_value(true)).changed() {
+                            if ui.add(egui::Slider::new(&mut sens, 0.01..=0.25).text("").show_value(true)).changed() {
                                 input.sensitivity = sens;
                             }
 

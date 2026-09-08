@@ -33,7 +33,7 @@ impl InputHandler {
             mode: ConfinementMode::Unconfined,
             last_cursor_pos: None,
             show_hud: false,
-            sensitivity: 0.02,
+            sensitivity: 0.05,
             accum_x: 0.0,
             accum_y: 0.0,
             is_at_edge: false,
@@ -415,12 +415,12 @@ mod tests {
     #[test]
     fn test_mouse_sensitivity_subpixel_accumulation() {
         let mut handler = InputHandler::new();
-        assert_eq!(handler.sensitivity, 0.02);
+        assert_eq!(handler.sensitivity, 0.05);
 
-        // delta of 10.0 points with 0.02 sens = 0.20 -> send_dx = 0, remainder 0.20
-        handler.accum_x += 10.0 * handler.sensitivity;
-        // After 40 more points (total 50 points * 0.02 = 1.0): send_dx = 1, remainder 0.0
-        handler.accum_x += 40.0 * handler.sensitivity;
+        // delta of 4.0 points with 0.05 sens = 0.20 -> send_dx = 0, remainder 0.20
+        handler.accum_x += 4.0 * handler.sensitivity;
+        // After 16 more points (total 20 points * 0.05 = 1.0): send_dx = 1, remainder 0.0
+        handler.accum_x += 16.0 * handler.sensitivity;
         let eps = if handler.accum_x >= 0.0 { 1e-4 } else { -1e-4 };
         let send_dx = (handler.accum_x + eps).trunc() as i16;
         assert_eq!(send_dx, 1);
