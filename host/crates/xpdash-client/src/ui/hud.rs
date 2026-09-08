@@ -102,12 +102,25 @@ impl HudOverlay {
                             // Pointer Lock Toggle
                             let is_conf = input.is_confined();
                             let lock_btn_text = if is_conf {
-                                egui::RichText::new("🔒 Confined [Right-Ctrl]").color(Color32::from_rgb(255, 170, 0))
+                                egui::RichText::new("🔒 Confined [F12]").color(Color32::from_rgb(255, 170, 0))
                             } else {
-                                egui::RichText::new("🔓 Unconfined [Right-Ctrl]").color(Color32::from_rgb(0, 220, 255))
+                                egui::RichText::new("🔓 Unconfined [F12]").color(Color32::from_rgb(0, 220, 255))
                             };
                             if ui.button(lock_btn_text).clicked() {
                                 input.toggle_confinement();
+                            }
+
+                            // Grab mode selector for Wayland / niri compatibility
+                            let grab_label = match input.grab_mode {
+                                egui::CursorGrab::Locked => "Grab: Locked",
+                                egui::CursorGrab::Confined => "Grab: Confined",
+                                egui::CursorGrab::None => "Grab: None",
+                            };
+                            if ui.small_button(grab_label).on_hover_text("Switch between Locked (pointer lock) and Confined (window bounds). Press F11 for Fullscreen on Wayland/niri.").clicked() {
+                                input.grab_mode = match input.grab_mode {
+                                    egui::CursorGrab::Locked => egui::CursorGrab::Confined,
+                                    _ => egui::CursorGrab::Locked,
+                                };
                             }
 
                             ui.separator();
@@ -123,6 +136,15 @@ impl HudOverlay {
                             ui.label("Vol:");
                             if ui.add(egui::Slider::new(&mut vol, 0.0..=1.5).text("").show_value(true)).changed() {
                                 audio.set_volume(vol);
+                            }
+
+                            ui.separator();
+
+                            // In-Game Mouse Sensitivity Slider
+                            ui.label("Sens:");
+                            let mut sens = input.sensitivity;
+                            if ui.add(egui::Slider::new(&mut sens, 0.05..=1.0).text("").show_value(true)).changed() {
+                                input.sensitivity = sens;
                             }
 
                             ui.separator();

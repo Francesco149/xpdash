@@ -116,6 +116,9 @@ impl StreamViewport {
 
         // 5. Ambient Confinement Border
         let (border_color, stroke_width) = match input.mode {
+            ConfinementMode::Confined if input.is_at_edge => {
+                (Color32::from_rgb(235, 87, 87), 3.0f32) // Red warning: hit window edge in niri/Wayland (press F11 for Fullscreen)
+            }
             ConfinementMode::Confined => (Color32::from_rgb(255, 170, 0), 2.5f32), // Amber glow
             ConfinementMode::Unconfined => (Color32::from_rgb(0, 180, 216), 1.5f32), // Cyan subtle border
         };

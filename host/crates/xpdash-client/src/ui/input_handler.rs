@@ -18,6 +18,11 @@ pub struct InputHandler {
     pub mode: ConfinementMode,
     pub last_cursor_pos: Option<Pos2>,
     pub show_hud: bool,
+    pub sensitivity: f32,
+    pub accum_x: f32,
+    pub accum_y: f32,
+    pub is_at_edge: bool,
+    pub grab_mode: egui::CursorGrab,
 }
 
 impl InputHandler {
@@ -26,6 +31,11 @@ impl InputHandler {
             mode: ConfinementMode::Unconfined,
             last_cursor_pos: None,
             show_hud: false,
+            sensitivity: 0.25,
+            accum_x: 0.0,
+            accum_y: 0.0,
+            is_at_edge: false,
+            grab_mode: egui::CursorGrab::Locked,
         }
     }
 
@@ -39,8 +49,10 @@ impl InputHandler {
             ConfinementMode::Confined => ConfinementMode::Unconfined,
         };
         self.last_cursor_pos = None;
+        self.accum_x = 0.0;
+        self.accum_y = 0.0;
+        self.is_at_edge = false;
     }
-
     pub fn set_confined(&mut self, confined: bool) {
         self.mode = if confined {
             ConfinementMode::Confined
@@ -48,8 +60,10 @@ impl InputHandler {
             ConfinementMode::Unconfined
         };
         self.last_cursor_pos = None;
+        self.accum_x = 0.0;
+        self.accum_y = 0.0;
+        self.is_at_edge = false;
     }
-
     /// Process egui input events and send corresponding network input messages
     pub fn handle_events(
         &mut self,
@@ -61,19 +75,41 @@ impl InputHandler {
     ) {
         // Enforce OS cursor lock mode
         if self.is_confined() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(self.grab_mode));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
 
-            // Continuous relative hardware delta tracking (never clamped by window borders)
+            // Detect if cursor reached viewport edge (when compositor ignores pointer lock)
+            if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                let margin = 4.0;
+                self.is_at_edge = pos.x <= viewport_rect.left() + margin
+                    || pos.x >= viewport_rect.right() - margin
+                    || pos.y <= viewport_rect.top() + margin
+                    || pos.y >= viewport_rect.bottom() - margin;
+            } else {
+                self.is_at_edge = false;
+            }
+
+            // Continuous relative hardware delta tracking with subpixel accumulation
             let delta = ctx.input(|i| i.pointer.delta());
             if delta.x != 0.0 || delta.y != 0.0 {
-                session.send_input(MsgInputEvent {
-                    event_type: INPUT_TYPE_MOUSE_REL,
-                    param1: 0,
-                    param2: delta.x as i16,
-                    param3: delta.y as i16,
-                    key_down: 0,
-                });
+                self.accum_x += delta.x * self.sensitivity;
+                self.accum_y += delta.y * self.sensitivity;
+
+                let send_dx = self.accum_x.trunc() as i16;
+                let send_dy = self.accum_y.trunc() as i16;
+
+                if send_dx != 0 || send_dy != 0 {
+                    self.accum_x -= send_dx as f32;
+                    self.accum_y -= send_dy as f32;
+
+                    session.send_input(MsgInputEvent {
+                        event_type: INPUT_TYPE_MOUSE_REL,
+                        param1: 0,
+                        param2: send_dx,
+                        param3: send_dy,
+                        key_down: 0,
+                    });
+                }
             }
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
@@ -355,5 +391,24 @@ mod tests {
 
         handler.set_confined(true);
         assert!(handler.is_confined());
+    }
+
+    #[test]
+    fn test_mouse_sensitivity_subpixel_accumulation() {
+        let mut handler = InputHandler::new();
+        assert_eq!(handler.sensitivity, 0.25);
+
+        // delta of 1.0 point with 0.25 sens = 0.25 -> send_dx = 0, remainder 0.25
+        handler.accum_x += 1.0 * handler.sensitivity;
+        let send_dx = handler.accum_x.trunc() as i16;
+        assert_eq!(send_dx, 0);
+        assert_eq!(handler.accum_x, 0.25);
+
+        // After 3 more points: total 1.0 -> send_dx = 1, remainder 0.0
+        handler.accum_x += 3.0 * handler.sensitivity;
+        let send_dx = handler.accum_x.trunc() as i16;
+        assert_eq!(send_dx, 1);
+        handler.accum_x -= send_dx as f32;
+        assert_eq!(handler.accum_x, 0.0);
     }
 }
