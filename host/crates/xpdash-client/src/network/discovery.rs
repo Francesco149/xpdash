@@ -91,12 +91,19 @@ impl DiscoveryService {
                 }
             };
 
+            // Immediate initial probe for configured targets
+            for ip in targets_clone.read().clone() {
+                let roster_ref = roster_clone.clone();
+                tokio::spawn(async move {
+                    probe_target(&roster_ref, &ip).await;
+                });
+            }
+
             let mut probe_interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + Duration::from_millis(1500),
-                Duration::from_millis(1500),
+                tokio::time::Instant::now() + Duration::from_millis(4000),
+                Duration::from_millis(4000),
             );
             let mut beacon_buf = [0u8; 512];
-
             loop {
                 tokio::select! {
                     _ = &mut cancel_rx => {
@@ -126,22 +133,8 @@ impl DiscoveryService {
                             continue;
                         }
 
-                        // 1. Broadcast beacon if identity exists
-                        if let (Some(ref sock), Some(ref id)) = (&beacon_sock, &identity) {
-                            let beacon = DiscoveryBeacon {
-                                control_port: TCP_CONTROL_PORT,
-                                media_port: UDP_MEDIA_PORT,
-                                server_name: "xpdash-client".to_string(),
-                                fingerprint: id.public_key_bytes(),
-                            };
-                            let encoded = beacon.encode();
-                            let bcast_addr: SocketAddr = format!("255.255.255.255:{}", UDP_BEACON_PORT).parse().unwrap();
-                            let _ = sock.send_to(&encoded, bcast_addr).await;
-                        }
-
-                        // 2. Active probe targets
+                        // Active probe targets periodically
                         let targets = targets_clone.read().clone();
-
                         for ip in targets {
                             let roster_ref = roster_clone.clone();
                             tokio::spawn(async move {
@@ -246,6 +239,11 @@ async fn probe_target(roster: &RigRoster, ip: &str) {
 }
 
 fn handle_discovered_beacon(roster: &RigRoster, ip: &str, beacon: DiscoveryBeacon) {
+    // Filter out client reflection or local loopback
+    if beacon.server_name == "xpdash-client" || ip == "127.0.0.1" {
+        return;
+    }
+
     let fp_hex: String = beacon.fingerprint.iter().map(|b| format!("{:02x}", b)).collect();
     update_roster(
         roster,

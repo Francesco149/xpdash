@@ -123,7 +123,7 @@ int net_listen_control(uint16_t port) {
         return 0;
     }
 
-    if (listen(g_sock_tcp, 1) != 0) {
+    if (listen(g_sock_tcp, 8) != 0) {
         closesocket(g_sock_tcp);
         g_sock_tcp = INVALID_SOCKET;
         return 0;
@@ -400,10 +400,9 @@ void net_poll_control(net_stream_state_cb on_state_change, void *user_data) {
             net_set_media_destination(ip, NET_UDP_MEDIA_PORT);
             g_tcp_buf_len = 0;
             g_is_authenticated = 0;
-            g_is_streaming = 1;
+            g_is_streaming = 0; // Wait for OP_STREAM_START before streaming
 
             send_hello_syn();
-            if (on_state_change) on_state_change(1, user_data);
         }
     } else {
         int space = sizeof(g_tcp_buf) - g_tcp_buf_len;
