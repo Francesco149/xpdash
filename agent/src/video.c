@@ -114,6 +114,19 @@ static int g_width = 0;
 static int g_height = 0;
 static uint32_t g_frame_counter = 0;
 static int g_force_keyframe = 1;
+static int g_bpp = 32;
+static int g_is_paletted = 0;
+
+/* 8-bit paletted capture support */
+static HDC g_hdc_mem8 = NULL;
+static HBITMAP g_hbm8 = NULL;
+static HBITMAP g_hbm8_old = NULL;
+static uint8_t *g_pixels8 = NULL;
+
+int video_get_bpp(void) {
+    return g_bpp;
+}
+
 
 static video_frame_cb g_cb = NULL;
 static void *g_cb_userdata = NULL;
@@ -186,6 +199,31 @@ int video_resize(int new_width, int new_height) {
     g_width = new_width;
     g_height = new_height;
 
+    /* Re-acquire screen DC to reflect mode/color depth changes */
+    if (g_hdc_screen) {
+        ReleaseDC(NULL, g_hdc_screen);
+        g_hdc_screen = NULL;
+    }
+    g_hdc_screen = GetDC(NULL);
+    if (!g_hdc_screen) {
+        agent_log("video_resize: GetDC(NULL) failed! err=%lu", GetLastError());
+        return 0;
+    }
+
+    if (!g_hdc_mem) {
+        g_hdc_mem = CreateCompatibleDC(g_hdc_screen);
+    }
+
+    /* Query display color depth and palette capability */
+    int dev_bpp = GetDeviceCaps(g_hdc_screen, BITSPIXEL);
+    int dev_planes = GetDeviceCaps(g_hdc_screen, PLANES);
+    int raster_caps = GetDeviceCaps(g_hdc_screen, RASTERCAPS);
+    g_bpp = dev_bpp * dev_planes;
+    g_is_paletted = (g_bpp == 8) || (raster_caps & RC_PALETTE);
+    agent_log("video_resize: display mode %dx%d@%d (paletted=%d, rc=0x%04X)",
+              g_width, g_height, g_bpp, g_is_paletted, raster_caps);
+
+    /* Clean up old 32-bit DIBSection */
     if (g_hbm) {
         if (g_hdc_mem && g_hbm_old) {
             SelectObject(g_hdc_mem, g_hbm_old);
@@ -222,6 +260,7 @@ int video_resize(int new_width, int new_height) {
         g_comp_buf_cap = max_comp_size;
     }
 
+    /* Allocate 32-bit DIBSection for compositing & TurboJPEG compression */
     BITMAPINFO bmi;
     memset(&bmi, 0, sizeof(bmi));
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -233,12 +272,64 @@ int video_resize(int new_width, int new_height) {
 
     g_hbm = CreateDIBSection(g_hdc_screen, &bmi, DIB_RGB_COLORS, (void **)&g_pixels, NULL, 0);
     if (!g_hbm || !g_pixels) {
-        agent_log("CreateDIBSection failed! err=%lu", GetLastError());
+        agent_log("CreateDIBSection 32-bit failed! err=%lu", GetLastError());
         return 0;
     }
-    agent_log("CreateDIBSection success: hbm=%p, pixels=%p", g_hbm, g_pixels);
-
     g_hbm_old = (HBITMAP)SelectObject(g_hdc_mem, g_hbm);
+    agent_log("CreateDIBSection 32-bit success: hbm=%p, pixels=%p", g_hbm, g_pixels);
+
+    /* Allocate or clean up 8-bit DIBSection for paletted capture */
+    if (g_hbm8) {
+        if (g_hdc_mem8 && g_hbm8_old) {
+            SelectObject(g_hdc_mem8, g_hbm8_old);
+        }
+        DeleteObject(g_hbm8);
+        g_hbm8 = NULL;
+        g_pixels8 = NULL;
+    }
+
+    if (g_is_paletted) {
+        if (!g_hdc_mem8) {
+            g_hdc_mem8 = CreateCompatibleDC(g_hdc_screen);
+        }
+
+        struct {
+            BITMAPINFOHEADER bmiHeader;
+            RGBQUAD bmiColors[256];
+        } bmi8;
+        memset(&bmi8, 0, sizeof(bmi8));
+        bmi8.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi8.bmiHeader.biWidth = g_width;
+        bmi8.bmiHeader.biHeight = -g_height; // Top-down DIB
+        bmi8.bmiHeader.biPlanes = 1;
+        bmi8.bmiHeader.biBitCount = 8;
+        bmi8.bmiHeader.biCompression = BI_RGB;
+        bmi8.bmiHeader.biClrUsed = 256;
+
+        PALETTEENTRY sys_pal[256];
+        memset(sys_pal, 0, sizeof(sys_pal));
+        GetSystemPaletteEntries(g_hdc_screen, 0, 256, sys_pal);
+        for (int i = 0; i < 256; i++) {
+            bmi8.bmiColors[i].rgbRed = sys_pal[i].peRed;
+            bmi8.bmiColors[i].rgbGreen = sys_pal[i].peGreen;
+            bmi8.bmiColors[i].rgbBlue = sys_pal[i].peBlue;
+            bmi8.bmiColors[i].rgbReserved = 0;
+        }
+
+        g_hbm8 = CreateDIBSection(g_hdc_screen, (BITMAPINFO *)&bmi8, DIB_RGB_COLORS, (void **)&g_pixels8, NULL, 0);
+        if (!g_hbm8 || !g_pixels8) {
+            agent_log("CreateDIBSection 8-bit failed! err=%lu", GetLastError());
+            return 0;
+        }
+        g_hbm8_old = (HBITMAP)SelectObject(g_hdc_mem8, g_hbm8);
+        agent_log("CreateDIBSection 8-bit success: hbm=%p, pixels=%p", g_hbm8, g_pixels8);
+    } else {
+        if (g_hdc_mem8) {
+            DeleteDC(g_hdc_mem8);
+            g_hdc_mem8 = NULL;
+        }
+    }
+
     g_force_keyframe = 1;
     return 1;
 }
@@ -383,8 +474,13 @@ int video_capture(void) {
     /* ── Path B: GDI BitBlt capture (fallback for desktop / non-D3D) ─ */
     int screen_w = GetSystemMetrics(SM_CXSCREEN);
     int screen_h = GetSystemMetrics(SM_CYSCREEN);
-    if (screen_w > 0 && screen_h > 0 && (g_width != screen_w || g_height != screen_h)) {
+    int cur_bpp = GetDeviceCaps(g_hdc_screen, BITSPIXEL) * GetDeviceCaps(g_hdc_screen, PLANES);
+    if (screen_w > 0 && screen_h > 0 &&
+        (g_width != screen_w || g_height != screen_h || g_bpp != cur_bpp)) {
+        agent_log("video_capture: screen display changed to %dx%d@%d", screen_w, screen_h, cur_bpp);
         video_resize(screen_w, screen_h);
+        net_send_video_resize((uint16_t)screen_w, (uint16_t)screen_h, (uint8_t)cur_bpp);
+        video_force_keyframe();
     }
 
     if (!g_hdc_screen || !g_hdc_mem || !g_pixels || !g_comp_buf) {
@@ -397,13 +493,45 @@ int video_capture(void) {
         return 0;
     }
 
-    if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
-        static int s_logged_blt_fail = 0;
-        if (!s_logged_blt_fail) {
-            agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
-            s_logged_blt_fail = 1;
+    if (g_is_paletted && g_hdc_mem8 && g_pixels8) {
+        if (!BitBlt(g_hdc_mem8, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
+            static int s_logged_blt8_fail = 0;
+            if (!s_logged_blt8_fail) {
+                agent_log("video_capture: 8-bit BitBlt failed! err=%lu", GetLastError());
+                s_logged_blt8_fail = 1;
+            }
+            return 0;
         }
-        return 0;
+
+        /* Retrieve active hardware/system palette (updates dynamically on palette animation & transitions) */
+        PALETTEENTRY sys_pal[256];
+        memset(sys_pal, 0, sizeof(sys_pal));
+        GetSystemPaletteEntries(g_hdc_screen, 0, 256, sys_pal);
+
+        /* Build 256-entry 32-bit BGRX LUT */
+        uint32_t lut[256];
+        for (int i = 0; i < 256; i++) {
+            lut[i] = ((uint32_t)sys_pal[i].peRed << 16) |
+                     ((uint32_t)sys_pal[i].peGreen << 8) |
+                     ((uint32_t)sys_pal[i].peBlue);
+        }
+
+        /* Expand 8-bit indices into 32-bit BGRX pixel buffer */
+        uint32_t *dst32 = (uint32_t *)g_pixels;
+        const uint8_t *src8 = g_pixels8;
+        int total_pixels = g_width * g_height;
+        for (int i = 0; i < total_pixels; i++) {
+            dst32[i] = lut[src8[i]];
+        }
+    } else {
+        if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
+            static int s_logged_blt_fail = 0;
+            if (!s_logged_blt_fail) {
+                agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
+                s_logged_blt_fail = 1;
+            }
+            return 0;
+        }
     }
 
     DWORD t1 = timeGetTime();
@@ -479,6 +607,18 @@ int video_capture(void) {
 
 void video_shutdown(void) {
     video_stop();
+    if (g_hdc_mem8) {
+        if (g_hbm8 && g_hbm8_old) {
+            SelectObject(g_hdc_mem8, g_hbm8_old);
+        }
+        DeleteDC(g_hdc_mem8);
+        g_hdc_mem8 = NULL;
+    }
+    if (g_hbm8) {
+        DeleteObject(g_hbm8);
+        g_hbm8 = NULL;
+        g_pixels8 = NULL;
+    }
     if (g_hdc_mem) {
         if (g_hbm && g_hbm_old) {
             SelectObject(g_hdc_mem, g_hbm_old);

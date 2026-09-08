@@ -2,6 +2,7 @@
 #include <ws2tcpip.h>
 #include "input.h"
 #include "log.h"
+#include "video.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -51,7 +52,8 @@ static void send_hello_syn(void) {
     msg.agent_version = 1;
     msg.screen_width = (uint16_t)GetSystemMetrics(SM_CXSCREEN);
     msg.screen_height = (uint16_t)GetSystemMetrics(SM_CYSCREEN);
-    msg.bpp = 32;
+    int cur_bpp = video_get_bpp();
+    msg.bpp = (cur_bpp > 0) ? (uint8_t)cur_bpp : 32;
 
     DWORD size = sizeof(msg.machine_name);
     if (GetComputerNameA(msg.machine_name, &size)) {

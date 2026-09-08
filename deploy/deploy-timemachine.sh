@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # deploy-timemachine.sh — Build and push xpdash-agent.exe to timemachine (10.0.10.113)
+# NOTE: See deploy/REMOTE_EXEC.md for SMBv1, smbexec, and iexec requirements and gotchas.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

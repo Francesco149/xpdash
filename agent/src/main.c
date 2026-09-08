@@ -64,9 +64,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_DISPLAYCHANGE: {
             int new_w = LOWORD(lParam);
             int new_h = HIWORD(lParam);
-            agent_log("WM_DISPLAYCHANGE: %dx%d", new_w, new_h);
+            int new_bpp = (int)wParam;
+            agent_log("WM_DISPLAYCHANGE: %dx%d@%d", new_w, new_h, new_bpp);
             video_resize(new_w, new_h);
-            net_send_video_resize((uint16_t)new_w, (uint16_t)new_h, 32);
+            int cur_bpp = video_get_bpp();
+            if (cur_bpp > 0) new_bpp = cur_bpp;
+            net_send_video_resize((uint16_t)new_w, (uint16_t)new_h, (uint8_t)new_bpp);
             video_force_keyframe();
             return 0;
         }

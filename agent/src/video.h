@@ -21,6 +21,9 @@ void video_force_keyframe(void);
 /* Handle resolution change event (e.g. from WM_DISPLAYCHANGE) */
 int video_resize(int new_width, int new_height);
 
+/* Query current screen color depth in bits per pixel (e.g. 8, 16, 24, 32) */
+int video_get_bpp(void);
+
 /* Start video capture background worker thread */
 int video_start(void);
 

@@ -42,6 +42,7 @@ xpdash/
 ├── ARCHITECTURE.md       # Full architectural design, data paths, and latency budget
 ├── PROTOCOL.md           # Wire protocol: Discovery, Handshake, Media streaming, Input
 ├── ROADMAP.md            # Multi-session development roadmap & execution status
+├── deploy/REMOTE_EXEC.md # Windows XP SMBv1 & remote execution (smbexec/iexec) gotchas
 ├── agent/                # Windows XP Native Agent (C / Win32, i686 subsystem 5.1)
 │   ├── Makefile          # mingw32 build file
 │   ├── build.sh          # Automated build script with PE import validation

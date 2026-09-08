@@ -334,10 +334,9 @@ To guarantee moonlight-grade reliability across all legacy software without requ
 | **GDI / DirectShow Video Overlay** | VBlank-synced `BitBlt` (`WaitForVerticalBlank` + `CreateDIBSection`) | 32-bit BGRX TurboJPEG quality 85 | Windows Desktop Explorer, *Windows Media Player 9/11*, *Kirikiri Visual Novels* |
 
 #### Validation Suite Requirements for Wild Windows XP Scenarios:
-1. **Resolution Switching**: Dynamic resolution change handling (`WM_DISPLAYCHANGE` + `Reset` hook) without stream disconnection or texture corruption (e.g. game launching at 640×480 then switching to 1024×768).
-2. **Color Depth Modes**: Palette expansion for 8-bit (256 colors) and 16-bit (High Color 565/555) games into standard BGRX before JPEG encoding.
+1. **Resolution Switching**: Dynamic resolution change handling (`WM_DISPLAYCHANGE` + `Reset` hook) without stream disconnection or texture corruption (e.g. game launching at 640×480 then switching to 1024×768). **[COMPLETED]**
+2. **Color Depth Modes**: Dynamic color depth detection and palette expansion for 8-bit (256 colors) via dual DIBSections (raw 8-bit index `BitBlt` + `GetSystemPaletteEntries` 256-color hardware DAC LUT expansion to 32-bit BGRX before TurboJPEG encoding). Verified on *Lords of the Realm II* (640×480@8bpp). **[COMPLETED]**
 3. **Cursor State Consistency**: Automatic cursor suppression when games invoke `ShowCursor(FALSE)` or DirectInput exclusive mode, with seamless host cursor alignment on unconfined desktop navigation.
-
 ## Future Sessions (Sessions 8 to 11): Advanced Input, Shaders & Packaging
 ### Session 8: Input Confinement & Modifier Routing Engine
 - Implement relative pointer confinement (pointer lock) with visual state indicator and configurable release hotkey (default `Right-Ctrl`).
