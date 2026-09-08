@@ -14,9 +14,17 @@ mkdir -p "$DIST_DIR"
 
 # 1. Build Linux Standalone Binaries
 echo ""
-echo "[1/4] Building Linux release binaries (xpdash-client, xpdash-server)..."
-cargo build --manifest-path host/Cargo.toml --release --bin xpdash-client --bin xpdash-server
-
+echo "[1/6] Building Linux release binaries (xpdash-client, xpdash-server)..."
+if [ -x "/usr/bin/cargo" ]; then
+    # When building on a host with system cargo, use native host toolchain
+    # (unsetting Nix compiler wrappers) so the resulting ELF binary uses
+    # standard /lib64/ld-linux-x86-64.so.2 and runs portably on any Linux distro.
+    env -u NIX_CC -u NIX_LDFLAGS -u NIX_CFLAGS_COMPILE -u NIX_HARDENING_ENABLE \
+        PATH="/usr/bin:$PATH" \
+        cargo build --manifest-path host/Cargo.toml --release --bin xpdash-client --bin xpdash-server
+else
+    cargo build --manifest-path host/Cargo.toml --release --bin xpdash-client --bin xpdash-server
+fi
 # 2. Build Windows 10/11 Client (xpdash-client.exe)
 echo ""
 echo "[2/6] Building Windows 10/11 client binary (xpdash-client.exe)..."
@@ -59,6 +67,14 @@ cat << 'EOF' > "$LINUX_PKG_DIR/run-client.sh"
 #!/usr/bin/env bash
 # Launch xpdash client in native GUI or OBS mode
 DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Ensure system library paths are in LD_LIBRARY_PATH for dlopen (Wayland, X11, GL, ALSA)
+for p in /usr/lib /usr/lib64 /usr/local/lib; do
+    if [ -d "$p" ]; then
+        export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$p"
+    fi
+done
+
 exec "$DIR/xpdash-client" "$@"
 EOF
 chmod +x "$LINUX_PKG_DIR/run-client.sh"
@@ -67,10 +83,16 @@ cat << 'EOF' > "$LINUX_PKG_DIR/run-obs.sh"
 #!/usr/bin/env bash
 # Launch xpdash client in OBS 1x fixed source size mode
 DIR="$(cd "$(dirname "$0")" && pwd)"
+
+for p in /usr/lib /usr/lib64 /usr/local/lib; do
+    if [ -d "$p" ]; then
+        export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$p"
+    fi
+done
+
 exec "$DIR/xpdash-client" --obs "$@"
 EOF
 chmod +x "$LINUX_PKG_DIR/run-obs.sh"
-
 tar -czf "$DIST_DIR/xpdash-linux-x86_64.tar.gz" -C "$DIST_DIR" "xpdash-linux-x86_64"
 echo "[+] Created: $DIST_DIR/xpdash-linux-x86_64.tar.gz ($(stat -c%s "$DIST_DIR/xpdash-linux-x86_64.tar.gz") bytes)"
 

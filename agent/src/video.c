@@ -150,12 +150,13 @@ static int   s_in_hook_mode = 0;
 static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
     (void)lpParam;
     agent_log("video_worker_thread: capture thread started");
-    DWORD next_frame_time = timeGetTime();
     DWORD frame_interval = (g_target_fps > 0) ? (1000 / g_target_fps) : 16;
     if (frame_interval == 0) frame_interval = 16;
 
     while (g_video_running) {
         if (net_is_streaming_active()) {
+            DWORD t_start = timeGetTime();
+
             /* If actively receiving D3D9 hook frames, frame rate is driven
                by Present() via d3d9hook_read_frame's internal event wait.
                Otherwise, wait for hardware VBlank or pace via multimedia timer. */
@@ -163,20 +164,22 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
                 if (g_pdd && !g_vblank_disabled) {
                     vblank_wait();
                 }
-                if (g_vblank_disabled || !g_pdd) {
-                    DWORD now = timeGetTime();
-                    if (now < next_frame_time) {
-                        DWORD sleep_ms = next_frame_time - now;
-                        if (sleep_ms > frame_interval) sleep_ms = frame_interval;
-                        Sleep(sleep_ms);
-                    }
-                    next_frame_time = timeGetTime() + frame_interval;
+            }
+
+            video_capture();
+
+            /* Frame pacing: ensure we never busy-spin the CPU */
+            if (!s_in_hook_mode || g_vblank_disabled) {
+                DWORD elapsed = timeGetTime() - t_start;
+                if (elapsed < frame_interval) {
+                    Sleep(frame_interval - elapsed);
+                } else {
+                    /* Always yield at least 2ms between frames to let other threads / system run */
+                    Sleep(2);
                 }
             }
-            video_capture();
         } else {
             Sleep(50);
-            next_frame_time = timeGetTime();
         }
     }
     agent_log("video_worker_thread: capture thread stopped");
@@ -577,24 +580,47 @@ int video_capture(void) {
     }
 
     DWORD t1 = timeGetTime();
-
     g_frame_counter++;
 
-    int is_keyframe = g_force_keyframe || ((g_frame_counter % KEYFRAME_INTERVAL) == 0);
-    int dirty = is_keyframe ? 1 : is_screen_dirty();
+    /* Check cursor movement */
+    CURSORINFO ci;
+    memset(&ci, 0, sizeof(ci));
+    ci.cbSize = sizeof(CURSORINFO);
+    int cursor_moved = 0;
+    static POINT s_last_cursor_pos = { -1, -1 };
+    static DWORD s_last_cursor_flags = 0;
+    if (GetCursorInfo(&ci)) {
+        if (ci.ptScreenPos.x != s_last_cursor_pos.x ||
+            ci.ptScreenPos.y != s_last_cursor_pos.y ||
+            ci.flags != s_last_cursor_flags) {
+            cursor_moved = 1;
+            s_last_cursor_pos = ci.ptScreenPos;
+            s_last_cursor_flags = ci.flags;
+        }
+    }
 
-    if (!dirty) {
+    int is_keyframe = g_force_keyframe || ((g_frame_counter % KEYFRAME_INTERVAL) == 0);
+    int screen_dirty = is_keyframe ? 1 : is_screen_dirty();
+
+    /* If neither the screen nor the cursor changed, skip encoding completely! */
+    if (!screen_dirty && !cursor_moved) {
         return 1;
     }
 
-    /* Draw cursor AFTER dirty check — compositing the cursor into the
-       framebuffer before comparison would make every frame "dirty" even
-       when nothing on screen changed, forcing full LZ4 compression. */
+    int raw_size = g_width * g_height * 4;
+
+    /* Update g_prev_pixels with the CLEAN desktop BEFORE drawing cursor!
+       This prevents the drawn cursor from making subsequent frames perpetually dirty. */
+    if (screen_dirty) {
+        memcpy(g_prev_pixels, g_pixels, raw_size);
+        g_force_keyframe = 0;
+    }
+
+    /* Draw cursor onto framebuffer for outgoing compressed frame */
     draw_cursor(g_hdc_mem);
 
     DWORD t2 = timeGetTime();
 
-    int raw_size = g_width * g_height * 4;
     unsigned long jpeg_size = 0;
     unsigned char *jpeg_buf = g_comp_buf;
     int comp_size = 0;
@@ -630,16 +656,15 @@ int video_capture(void) {
 
         DWORD t4 = timeGetTime();
 
-        memcpy(g_prev_pixels, g_pixels, raw_size);
-        g_force_keyframe = 0;
-
+        // Note: g_prev_pixels is already updated with clean desktop above!
         /* Log frame timing every 120 frames (~2s at 60fps) */
         static uint32_t s_timing_accum = 0;
         s_timing_accum++;
-        if (s_timing_accum >= 120) {
-            agent_log("frame_timing[blt]: blt=%lums comp=%lums send=%lums total=%lums comp_sz=%d",
-                      (unsigned long)(t1 - t0), (unsigned long)(t3 - t2),
-                      (unsigned long)(t4 - t3), (unsigned long)(t4 - t0), comp_size);
+        if (s_timing_accum >= 10) {
+            agent_log("frame_timing[blt]: blt=%lums cursor=%lums comp=%lums send=%lums total=%lums comp_sz=%d",
+                      (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
+                      (unsigned long)(t3 - t2), (unsigned long)(t4 - t3),
+                      (unsigned long)(t4 - t0), comp_size);
             s_timing_accum = 0;
         }
     }
