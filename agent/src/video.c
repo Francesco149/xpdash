@@ -43,20 +43,25 @@ static void vblank_init(void) {
     agent_log("vblank_init: DirectDraw hardware VSync synchronization initialized (pdd=%p)", g_pdd);
 }
 
+static int g_vblank_disabled = 0;
+static int g_target_fps = 60;
+static int g_jpeg_quality = 85;
+
 static void vblank_wait(void) {
-    if (g_pdd) {
+    if (g_pdd && !g_vblank_disabled) {
         /* Wait for the next vertical blanking interval to begin.
            During VBlank the front buffer is stable — Present() has
-           completed and the game hasn't started drawing the next frame.
-           Single BLOCKBEGIN is sufficient; the double-wait pattern
-           (BLOCKEND then BLOCKBEGIN) costs an extra VSync period. */
+           completed and the game hasn't started drawing the next frame. */
         HRESULT hr = g_pdd->lpVtbl->WaitForVerticalBlank(g_pdd, DDWAITVB_BLOCKBEGIN, NULL);
         if (FAILED(hr)) {
             static int s_logged_vb_fail = 0;
             if (!s_logged_vb_fail) {
-                agent_log("vblank_wait: WaitForVerticalBlank failed hr=0x%08lX", (unsigned long)hr);
+                agent_log("vblank_wait: WaitForVerticalBlank failed hr=0x%08lX; disabling DirectDraw VSync (falling back to multimedia timer pacing)", (unsigned long)hr);
                 s_logged_vb_fail = 1;
             }
+            g_vblank_disabled = 1;
+            g_pdd->lpVtbl->Release(g_pdd);
+            g_pdd = NULL;
         }
     }
 }
@@ -145,22 +150,33 @@ static int   s_in_hook_mode = 0;
 static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
     (void)lpParam;
     agent_log("video_worker_thread: capture thread started");
+    DWORD next_frame_time = timeGetTime();
+    DWORD frame_interval = (g_target_fps > 0) ? (1000 / g_target_fps) : 16;
+    if (frame_interval == 0) frame_interval = 16;
 
     while (g_video_running) {
         if (net_is_streaming_active()) {
             /* If actively receiving D3D9 hook frames, frame rate is driven
                by Present() via d3d9hook_read_frame's internal event wait.
-               Otherwise, wait for hardware VBlank or sleep 16ms for desktop capture. */
+               Otherwise, wait for hardware VBlank or pace via multimedia timer. */
             if (!s_in_hook_mode) {
-                if (g_pdd) {
+                if (g_pdd && !g_vblank_disabled) {
                     vblank_wait();
-                } else {
-                    Sleep(16);
+                }
+                if (g_vblank_disabled || !g_pdd) {
+                    DWORD now = timeGetTime();
+                    if (now < next_frame_time) {
+                        DWORD sleep_ms = next_frame_time - now;
+                        if (sleep_ms > frame_interval) sleep_ms = frame_interval;
+                        Sleep(sleep_ms);
+                    }
+                    next_frame_time = timeGetTime() + frame_interval;
                 }
             }
             video_capture();
         } else {
             Sleep(50);
+            next_frame_time = timeGetTime();
         }
     }
     agent_log("video_worker_thread: capture thread stopped");
@@ -366,10 +382,14 @@ int video_init(video_frame_cb callback, void *user_data) {
     }
 
     g_capture_layered = GetPrivateProfileIntA("video", "capture_layered", 1, "C:\\xpdash\\agent.ini");
-    agent_log("video_init: capture_layered=%d (%s)",
-              g_capture_layered,
-              g_capture_layered ? "SRCCOPY | CAPTUREBLT (includes transparent & layered windows)" : "SRCCOPY (legacy)");
+    g_target_fps = GetPrivateProfileIntA("video", "target_fps", 60, "C:\\xpdash\\agent.ini");
+    if (g_target_fps <= 0 || g_target_fps > 120) g_target_fps = 60;
 
+    g_jpeg_quality = GetPrivateProfileIntA("video", "jpeg_quality", 85, "C:\\xpdash\\agent.ini");
+    if (g_jpeg_quality < 30 || g_jpeg_quality > 100) g_jpeg_quality = 85;
+
+    agent_log("video_init: capture_layered=%d, target_fps=%d, jpeg_quality=%d",
+              g_capture_layered, g_target_fps, g_jpeg_quality);
     int w = GetSystemMetrics(SM_CXSCREEN);
     int h = GetSystemMetrics(SM_CYSCREEN);
     agent_log("video_init: GetSystemMetrics = %dx%d", w, h);
@@ -423,7 +443,7 @@ int video_capture(void) {
 
             if (g_tj && tjCompress2(g_tj, g_pixels, (int)hook_w, 0, (int)hook_h,
                                      TJPF_BGRX, &jpeg_buf, &jpeg_size,
-                                     TJSAMP_420, JPEG_QUALITY,
+                                     TJSAMP_420, g_jpeg_quality,
                                      TJFLAG_FASTDCT | TJFLAG_NOREALLOC) == 0) {
                 comp_size = (int)jpeg_size;
                 codec = 1;  /* VIDEO_CODEC_JPEG */
@@ -582,7 +602,7 @@ int video_capture(void) {
 
     if (g_tj && tjCompress2(g_tj, g_pixels, g_width, 0, g_height,
                              TJPF_BGRX, &jpeg_buf, &jpeg_size,
-                             TJSAMP_420, JPEG_QUALITY,
+                             TJSAMP_420, g_jpeg_quality,
                              TJFLAG_FASTDCT | TJFLAG_NOREALLOC) == 0) {
         comp_size = (int)jpeg_size;
         codec = 1;  /* VIDEO_CODEC_JPEG */
