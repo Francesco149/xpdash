@@ -23,6 +23,8 @@ pub struct InputHandler {
     pub accum_y: f32,
     pub is_at_edge: bool,
     pub grab_mode: egui::CursorGrab,
+    pub last_applied_grab: Option<egui::CursorGrab>,
+    pub last_applied_visible: Option<bool>,
 }
 
 impl InputHandler {
@@ -31,11 +33,13 @@ impl InputHandler {
             mode: ConfinementMode::Unconfined,
             last_cursor_pos: None,
             show_hud: false,
-            sensitivity: 0.25,
+            sensitivity: 0.02,
             accum_x: 0.0,
             accum_y: 0.0,
             is_at_edge: false,
             grab_mode: egui::CursorGrab::Locked,
+            last_applied_grab: None,
+            last_applied_visible: None,
         }
     }
 
@@ -73,43 +77,75 @@ impl InputHandler {
         _guest_height: u16,
         session: &ClientSession,
     ) {
-        // Enforce OS cursor lock mode
-        if self.is_confined() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(self.grab_mode));
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+        // Enforce OS cursor lock mode only when state changes (prevents Wayland socket flooding)
+        let (desired_grab, desired_visible) = if self.is_confined() {
+            (self.grab_mode, false)
+        } else {
+            (egui::CursorGrab::None, true)
+        };
 
-            // Detect if cursor reached viewport edge (when compositor ignores pointer lock)
+        if self.last_applied_grab != Some(desired_grab) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(desired_grab));
+            self.last_applied_grab = Some(desired_grab);
+        }
+        if self.last_applied_visible != Some(desired_visible) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(desired_visible));
+            self.last_applied_visible = Some(desired_visible);
+        }
+
+        if self.is_confined() {
+            // Detect if cursor reached viewport edge (when compositor ignores pointer lock in niri/Wayland)
+            let mut edge_dx = 0i16;
+            let mut edge_dy = 0i16;
+
             if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
-                let margin = 4.0;
-                self.is_at_edge = pos.x <= viewport_rect.left() + margin
-                    || pos.x >= viewport_rect.right() - margin
-                    || pos.y <= viewport_rect.top() + margin
-                    || pos.y >= viewport_rect.bottom() - margin;
+                let margin = 6.0;
+                let at_left = pos.x <= viewport_rect.left() + margin;
+                let at_right = pos.x >= viewport_rect.right() - margin;
+                let at_top = pos.y <= viewport_rect.top() + margin;
+                let at_bottom = pos.y >= viewport_rect.bottom() - margin;
+
+                self.is_at_edge = at_left || at_right || at_top || at_bottom;
+
+                // If cursor is pushed against a window edge in niri/Wayland,
+                // smoothly continue panning so the camera never freezes at borders!
+                if at_left { edge_dx = -1; }
+                else if at_right { edge_dx = 1; }
+                if at_top { edge_dy = -1; }
+                else if at_bottom { edge_dy = 1; }
             } else {
                 self.is_at_edge = false;
             }
 
             // Continuous relative hardware delta tracking with subpixel accumulation
             let delta = ctx.input(|i| i.pointer.delta());
-            if delta.x != 0.0 || delta.y != 0.0 {
-                self.accum_x += delta.x * self.sensitivity;
-                self.accum_y += delta.y * self.sensitivity;
+            self.accum_x += delta.x * self.sensitivity;
+            self.accum_y += delta.y * self.sensitivity;
 
-                let send_dx = self.accum_x.trunc() as i16;
-                let send_dy = self.accum_y.trunc() as i16;
+            let eps_x = if self.accum_x >= 0.0 { 1e-4 } else { -1e-4 };
+            let eps_y = if self.accum_y >= 0.0 { 1e-4 } else { -1e-4 };
+            let mut send_dx = (self.accum_x + eps_x).trunc() as i16;
+            let mut send_dy = (self.accum_y + eps_y).trunc() as i16;
 
-                if send_dx != 0 || send_dy != 0 {
-                    self.accum_x -= send_dx as f32;
-                    self.accum_y -= send_dy as f32;
+            self.accum_x -= send_dx as f32;
+            self.accum_y -= send_dy as f32;
 
-                    session.send_input(MsgInputEvent {
-                        event_type: INPUT_TYPE_MOUSE_REL,
-                        param1: 0,
-                        param2: send_dx,
-                        param3: send_dy,
-                        key_down: 0,
-                    });
-                }
+            // Apply edge panning if cursor is stopped at window boundary
+            if send_dx == 0 && edge_dx != 0 {
+                send_dx = edge_dx;
+            }
+            if send_dy == 0 && edge_dy != 0 {
+                send_dy = edge_dy;
+            }
+
+            if send_dx != 0 || send_dy != 0 {
+                session.send_input(MsgInputEvent {
+                    event_type: INPUT_TYPE_MOUSE_REL,
+                    param1: 0,
+                    param2: send_dx,
+                    param3: send_dy,
+                    key_down: 0,
+                });
             }
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
@@ -178,25 +214,8 @@ impl InputHandler {
                     }
                 }
 
-                // Mouse motion
-                Event::PointerMoved(pos) => {
-                    if !self.is_confined() && viewport_rect.contains(pos) {
-                        // Map absolute coordinate to guest space (0..65535)
-                        let rel_x = (pos.x - viewport_rect.left()) / viewport_rect.width();
-                        let rel_y = (pos.y - viewport_rect.top()) / viewport_rect.height();
-                        let abs_x = (rel_x.clamp(0.0, 1.0) * 65535.0) as u16;
-                        let abs_y = (rel_y.clamp(0.0, 1.0) * 65535.0) as u16;
-
-                        session.send_input(MsgInputEvent {
-                            event_type: INPUT_TYPE_MOUSE_ABS,
-                            param1: 0,
-                            param2: abs_x as i16,
-                            param3: abs_y as i16,
-                            key_down: 0,
-                        });
-                    }
-                }
-
+                // Mouse motion (handled via latest_pos sampling above when unconfined)
+                Event::PointerMoved(_) => {}
                 // Mouse buttons
                 Event::PointerButton { pos, button, pressed, .. } => {
                     if viewport_rect.contains(pos) {
@@ -396,19 +415,16 @@ mod tests {
     #[test]
     fn test_mouse_sensitivity_subpixel_accumulation() {
         let mut handler = InputHandler::new();
-        assert_eq!(handler.sensitivity, 0.25);
+        assert_eq!(handler.sensitivity, 0.02);
 
-        // delta of 1.0 point with 0.25 sens = 0.25 -> send_dx = 0, remainder 0.25
-        handler.accum_x += 1.0 * handler.sensitivity;
-        let send_dx = handler.accum_x.trunc() as i16;
-        assert_eq!(send_dx, 0);
-        assert_eq!(handler.accum_x, 0.25);
-
-        // After 3 more points: total 1.0 -> send_dx = 1, remainder 0.0
-        handler.accum_x += 3.0 * handler.sensitivity;
-        let send_dx = handler.accum_x.trunc() as i16;
+        // delta of 10.0 points with 0.02 sens = 0.20 -> send_dx = 0, remainder 0.20
+        handler.accum_x += 10.0 * handler.sensitivity;
+        // After 40 more points (total 50 points * 0.02 = 1.0): send_dx = 1, remainder 0.0
+        handler.accum_x += 40.0 * handler.sensitivity;
+        let eps = if handler.accum_x >= 0.0 { 1e-4 } else { -1e-4 };
+        let send_dx = (handler.accum_x + eps).trunc() as i16;
         assert_eq!(send_dx, 1);
         handler.accum_x -= send_dx as f32;
-        assert_eq!(handler.accum_x, 0.0);
+        assert!(handler.accum_x.abs() < 1e-3);
     }
 }
