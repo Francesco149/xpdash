@@ -442,10 +442,15 @@ void net_poll_control(net_stream_state_cb on_state_change, void *user_data) {
 void net_poll_udp_input(void) {
     if (g_sock_udp == INVALID_SOCKET) return;
 
-    /* Drain all pending UDP input datagrams without blocking */
+    /* Drain pending UDP input datagrams without blocking.
+       Coalesce mouse moves within the batch to prevent Win32 input queue flooding. */
     uint8_t buf[64];
     struct sockaddr_in from_addr;
     int from_len;
+
+    int has_abs = 0;
+    uint16_t last_abs_x = 0, last_abs_y = 0;
+    int32_t accum_rel_dx = 0, accum_rel_dy = 0;
 
     for (int batch = 0; batch < 64; batch++) {
         from_len = sizeof(from_addr);
@@ -465,12 +470,25 @@ void net_poll_udp_input(void) {
                         input_inject_key(ev->param1, ev->key_down, 0);
                         break;
                     case INPUT_TYPE_MOUSE_REL:
-                        input_inject_mouse_rel(ev->param2, ev->param3);
+                        accum_rel_dx += ev->param2;
+                        accum_rel_dy += ev->param3;
                         break;
                     case INPUT_TYPE_MOUSE_ABS:
-                        input_inject_mouse_abs((uint16_t)ev->param2, (uint16_t)ev->param3);
+                        has_abs = 1;
+                        last_abs_x = (uint16_t)ev->param2;
+                        last_abs_y = (uint16_t)ev->param3;
                         break;
                     case INPUT_TYPE_MOUSE_BTN:
+                        // Flush any pending mouse motion before click
+                        if (has_abs) {
+                            input_inject_mouse_abs(last_abs_x, last_abs_y);
+                            has_abs = 0;
+                        }
+                        if (accum_rel_dx != 0 || accum_rel_dy != 0) {
+                            input_inject_mouse_rel((int16_t)accum_rel_dx, (int16_t)accum_rel_dy);
+                            accum_rel_dx = 0;
+                            accum_rel_dy = 0;
+                        }
                         input_inject_mouse_btn(ev->param1, ev->key_down);
                         break;
                     case INPUT_TYPE_MOUSE_WHEEL:
@@ -479,6 +497,18 @@ void net_poll_udp_input(void) {
                 }
             }
         }
+    }
+
+    // Flush coalesced mouse motion at the end of the batch
+    if (has_abs) {
+        input_inject_mouse_abs(last_abs_x, last_abs_y);
+    }
+    if (accum_rel_dx != 0 || accum_rel_dy != 0) {
+        if (accum_rel_dx > 32767) accum_rel_dx = 32767;
+        if (accum_rel_dx < -32768) accum_rel_dx = -32768;
+        if (accum_rel_dy > 32767) accum_rel_dy = 32767;
+        if (accum_rel_dy < -32768) accum_rel_dy = -32768;
+        input_inject_mouse_rel((int16_t)accum_rel_dx, (int16_t)accum_rel_dy);
     }
 }
 

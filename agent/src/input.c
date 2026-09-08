@@ -60,15 +60,12 @@ void input_inject_mouse_abs(uint16_t x, uint16_t y) {
     if (py >= sh) py = sh - 1;
 
     if (cursor_showing) {
-        /* Desktop / Menu mode: set cursor position directly */
+        /* Desktop / Menu mode: set cursor position directly.
+           Deduplicate redundant positions and avoid redundant SendInput calls. */
+        if (px == s_prev_abs_x && py == s_prev_abs_y) {
+            return;
+        }
         SetCursorPos(px, py);
-        INPUT inp;
-        memset(&inp, 0, sizeof(inp));
-        inp.type = INPUT_MOUSE;
-        inp.mi.dx = (LONG)x;
-        inp.mi.dy = (LONG)y;
-        inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-        SendInput(1, &inp, sizeof(INPUT));
         s_prev_abs_x = px;
         s_prev_abs_y = py;
     } else {

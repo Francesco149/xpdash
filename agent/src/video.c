@@ -174,8 +174,8 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
                 if (elapsed < frame_interval) {
                     Sleep(frame_interval - elapsed);
                 } else {
-                    /* When frame takes longer than interval (e.g. slow GDI BitBlt), yield 10ms to let CPU rest */
-                    Sleep(10);
+                    /* On slower PCIe readback systems, sleep at least 33ms between desktop BitBlts to yield CPU */
+                    Sleep(33);
                 }
             }
         } else {
@@ -604,28 +604,18 @@ int video_capture(void) {
     DWORD t1 = timeGetTime();
     g_frame_counter++;
 
-    /* Check cursor movement */
+    /* Query cursor for compositing onto dirty frames */
     CURSORINFO ci;
     memset(&ci, 0, sizeof(ci));
     ci.cbSize = sizeof(CURSORINFO);
-    int cursor_moved = 0;
-    static POINT s_last_cursor_pos = { -1, -1 };
-    static DWORD s_last_cursor_flags = 0;
-    if (GetCursorInfo(&ci)) {
-        if (ci.ptScreenPos.x != s_last_cursor_pos.x ||
-            ci.ptScreenPos.y != s_last_cursor_pos.y ||
-            ci.flags != s_last_cursor_flags) {
-            cursor_moved = 1;
-            s_last_cursor_pos = ci.ptScreenPos;
-            s_last_cursor_flags = ci.flags;
-        }
-    }
-
+    GetCursorInfo(&ci);
     int is_keyframe = g_force_keyframe || ((g_frame_counter % KEYFRAME_INTERVAL) == 0);
     int screen_dirty = is_keyframe ? 1 : is_screen_dirty();
 
-    /* If neither the screen nor the cursor changed, skip encoding completely! */
-    if (!screen_dirty && !cursor_moved) {
+    /* If screen did not change, skip encoding completely!
+       In desktop mode, the client renders its own local cursor with zero latency.
+       Only re-encode and transmit video frames when screen pixels actually change. */
+    if (!screen_dirty) {
         return 1;
     }
 
