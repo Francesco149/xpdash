@@ -174,8 +174,8 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
                 if (elapsed < frame_interval) {
                     Sleep(frame_interval - elapsed);
                 } else {
-                    /* Always yield at least 2ms between frames to let other threads / system run */
-                    Sleep(2);
+                    /* When frame takes longer than interval (e.g. slow GDI BitBlt), yield 10ms to let CPU rest */
+                    Sleep(10);
                 }
             }
         } else {
@@ -399,11 +399,33 @@ int video_init(video_frame_cb callback, void *user_data) {
     return video_resize(w, h);
 }
 
-/* Fast comparison: check if framebuffer has differences */
+/* Fast comparison: check if visible 24-bit RGB framebuffer has differences,
+   masking out the unused 4th byte (X/Alpha) which contains uninitialized VRAM padding in GDI */
 static int is_screen_dirty(void) {
     if (!g_pixels || !g_prev_pixels) return 1;
-    int raw_size = g_width * g_height * 4;
-    return (memcmp(g_pixels, g_prev_pixels, raw_size) != 0);
+    const uint32_t *p1 = (const uint32_t *)g_pixels;
+    const uint32_t *p2 = (const uint32_t *)g_prev_pixels;
+    int total_pixels = g_width * g_height;
+
+    int rgb_diff = 0;
+    int alpha_only_diff = 0;
+    for (int i = 0; i < total_pixels; i++) {
+        uint32_t diff = p1[i] ^ p2[i];
+        if ((diff & 0x00FFFFFF) != 0) {
+            rgb_diff++;
+        } else if (diff != 0) {
+            alpha_only_diff++;
+        }
+    }
+
+    static int s_check_count = 0;
+    s_check_count++;
+    if ((s_check_count % 30) == 0) {
+        agent_log("is_screen_dirty: rgb_diff=%d, alpha_only_diff=%d (total=%d, threshold=16)",
+                  rgb_diff, alpha_only_diff, total_pixels);
+    }
+
+    return (rgb_diff > 16);
 }
 
 int video_capture(void) {
