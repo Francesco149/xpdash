@@ -47,6 +47,41 @@ static int g_vblank_disabled = 0;
 static int g_target_fps = 60;
 static int g_desktop_fps = 20;
 static int g_jpeg_quality = 85;
+static char g_adapter_name[128] = "Unknown";
+static int g_is_accelerated = 1;
+
+static void check_display_driver_acceleration(void) {
+    DISPLAY_DEVICEA dd;
+    memset(&dd, 0, sizeof(dd));
+    dd.cb = sizeof(dd);
+
+    if (EnumDisplayDevicesA(NULL, 0, &dd, 0)) {
+        strncpy(g_adapter_name, dd.DeviceString, sizeof(g_adapter_name) - 1);
+        g_adapter_name[sizeof(g_adapter_name) - 1] = '\0';
+    }
+
+    // Check for fallback / unaccelerated display drivers on Windows XP
+    if (strstr(g_adapter_name, "VGA") ||
+        strstr(g_adapter_name, "VgaSave") ||
+        strstr(g_adapter_name, "Standard") ||
+        strstr(g_adapter_name, "Microsoft Basic") ||
+        strstr(g_adapter_name, "mv video hook")) {
+        g_is_accelerated = 0;
+    }
+
+    agent_log("display: active adapter '%s' (hardware_accel=%s)",
+              g_adapter_name, g_is_accelerated ? "YES" : "NO (FALLBACK/DEGRADED)");
+
+    if (!g_is_accelerated) {
+        agent_log("================================================================");
+        agent_log("WARNING: UNACCELERATED OR FALLBACK DISPLAY DRIVER DETECTED!");
+        agent_log("Display Adapter: '%s'", g_adapter_name);
+        agent_log("Running in software fallback mode with degraded GDI performance.");
+        agent_log("Install official GPU drivers (ATI Catalyst / NVIDIA ForceWare) to");
+        agent_log("enable hardware Direct3D/DirectDraw acceleration and 60 FPS streaming.");
+        agent_log("================================================================");
+    }
+}
 static void vblank_wait(void) {
     if (g_pdd && !g_vblank_disabled) {
         /* Wait for the next vertical blanking interval to begin.
@@ -419,6 +454,7 @@ int video_init(video_frame_cb callback, void *user_data) {
     g_jpeg_quality = GetPrivateProfileIntA("video", "jpeg_quality", 85, "C:\\xpdash\\agent.ini");
     if (g_jpeg_quality < 30 || g_jpeg_quality > 100) g_jpeg_quality = 85;
 
+    check_display_driver_acceleration();
     agent_log("video_init: capture_layered=%d, target_fps=%d, desktop_fps=%d, jpeg_quality=%d",
               g_capture_layered, g_target_fps, g_desktop_fps, g_jpeg_quality);
     int w = GetSystemMetrics(SM_CXSCREEN);
