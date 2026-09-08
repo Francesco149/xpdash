@@ -21,6 +21,8 @@ mkdir \\xpdash;
 cd \\xpdash;
 lcd agent/bin;
 put xpdash-agent.exe;
+put xpdash-hook.dll;
+put xpdash-hook9.dll;
 lcd ../../deploy;
 put agent.ini;
 "

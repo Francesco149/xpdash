@@ -12,6 +12,7 @@
 #include "log.h"
 #include <windows.h>
 #include <tlhelp32.h>
+#include <d3d9.h>
 #include <stdio.h>
 
 /* ─── State ───────────────────────────────────────────────────────────── */
@@ -30,6 +31,47 @@ static HMODULE g_remote_dll_base = NULL;
 
 /* ─── Init / Shutdown ─────────────────────────────────────────────────── */
 
+/* Resolve Present and Reset RVAs dynamically from d3d9.dll once at startup */
+static void resolve_d3d9_rvas(uint32_t *p_present_rva, uint32_t *p_reset_rva) {
+    *p_present_rva = 0x40EA0; /* Standard XP SP3 default fallback */
+    *p_reset_rva   = 0x436B0;
+
+    HMODULE hd3d9 = LoadLibraryA("d3d9.dll");
+    if (!hd3d9) return;
+
+    typedef IDirect3D9 *(WINAPI *Direct3DCreate9_t)(UINT);
+    Direct3DCreate9_t pCreate9 = (Direct3DCreate9_t)(void *)GetProcAddress(hd3d9, "Direct3DCreate9");
+    if (pCreate9) {
+        IDirect3D9 *d3d = pCreate9(D3D_SDK_VERSION);
+        if (d3d) {
+            HWND hwnd = CreateWindowExA(0, "STATIC", "xpdash_probe", WS_POPUP, 0, 0, 1, 1, NULL, NULL, GetModuleHandleA(NULL), NULL);
+            D3DPRESENT_PARAMETERS pp;
+            memset(&pp, 0, sizeof(pp));
+            pp.Windowed = TRUE;
+            pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+            pp.hDeviceWindow = hwnd;
+
+            IDirect3DDevice9 *dev = NULL;
+            HRESULT hr = d3d->lpVtbl->CreateDevice(d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
+            if (SUCCEEDED(hr) && dev) {
+                void **vt = *(void ***)dev;
+                uintptr_t present_addr = (uintptr_t)vt[17];
+                uintptr_t reset_addr   = (uintptr_t)vt[16];
+                uintptr_t base         = (uintptr_t)hd3d9;
+                if (present_addr > base && reset_addr > base) {
+                    *p_present_rva = (uint32_t)(present_addr - base);
+                    *p_reset_rva   = (uint32_t)(reset_addr - base);
+                    agent_log("d3d9hook_init: resolved D3D9 RVAs dynamically: Present=0x%lX, Reset=0x%lX",
+                              (unsigned long)*p_present_rva, (unsigned long)*p_reset_rva);
+                }
+                dev->lpVtbl->Release(dev);
+            }
+            if (hwnd) DestroyWindow(hwnd);
+            d3d->lpVtbl->Release(d3d);
+        }
+    }
+}
+
 int d3d9hook_init(void) {
     if (!g_hook_cs_inited) {
         InitializeCriticalSection(&g_hook_cs);
@@ -44,37 +86,52 @@ int d3d9hook_init(void) {
     g_injected_proc = NULL;
     g_injected_pid  = 0;
     g_remote_dll_base = NULL;
+
+    uint32_t present_rva = 0, reset_rva = 0;
+    resolve_d3d9_rvas(&present_rva, &reset_rva);
+
+    /* Pre-create shared memory mapping and write dynamic RVAs so injected hook can read them */
+    g_shm_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                      0, HOOK_SHM_TOTAL_SIZE, XPDASH_HOOK_SHM_NAME);
+    if (g_shm_handle) {
+        g_shm_ptr = MapViewOfFile(g_shm_handle, FILE_MAP_ALL_ACCESS, 0, 0, HOOK_SHM_TOTAL_SIZE);
+        if (g_shm_ptr) {
+            HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+            hdr->magic = 0x48443344;
+            hdr->present_rva = present_rva;
+            hdr->reset_rva   = reset_rva;
+            hdr->hook_active = 0;
+        }
+    }
     LeaveCriticalSection(&g_hook_cs);
     return 1;
 }
 
 /* Must be called while holding g_hook_cs */
 static int open_shm_locked(void) {
-    if (g_shm_ptr) return 1;  /* already open */
-
-    g_shm_handle = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE,
-                                     XPDASH_HOOK_SHM_NAME);
-    if (!g_shm_handle) return 0;
-
-    g_shm_ptr = MapViewOfFile(g_shm_handle, FILE_MAP_ALL_ACCESS,
-                              0, 0, HOOK_SHM_TOTAL_SIZE);
-    if (!g_shm_ptr) {
-        CloseHandle(g_shm_handle);
-        g_shm_handle = NULL;
-        return 0;
+    if (!g_shm_handle) {
+        g_shm_handle = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, XPDASH_HOOK_SHM_NAME);
+        if (!g_shm_handle) return 0;
     }
 
-    g_frame_event = OpenEventA(EVENT_ALL_ACCESS, FALSE, XPDASH_HOOK_EVENT_NAME);
-    g_ack_event   = OpenEventA(EVENT_ALL_ACCESS, FALSE, XPDASH_HOOK_ACK_NAME);
+    if (!g_shm_ptr) {
+        g_shm_ptr = MapViewOfFile(g_shm_handle, FILE_MAP_ALL_ACCESS, 0, 0, HOOK_SHM_TOTAL_SIZE);
+        if (!g_shm_ptr) {
+            CloseHandle(g_shm_handle);
+            g_shm_handle = NULL;
+            return 0;
+        }
+    }
 
     if (!g_frame_event) {
-        agent_log("d3d9hook: opened SHM but no frame event");
+        g_frame_event = OpenEventA(EVENT_ALL_ACCESS, FALSE, XPDASH_HOOK_EVENT_NAME);
+    }
+    if (!g_ack_event) {
+        g_ack_event   = OpenEventA(EVENT_ALL_ACCESS, FALSE, XPDASH_HOOK_ACK_NAME);
     }
 
     HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
-    agent_log("d3d9hook: SHM opened, magic=0x%08lX, active=%lu",
-              (unsigned long)hdr->magic, (unsigned long)hdr->hook_active);
-    return 1;
+    return (hdr->magic == 0x48443344);
 }
 
 /* Must be called while holding g_hook_cs */
@@ -290,48 +347,12 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
     return 1;
 }
 
-static void d3d9hook_try_rehook(void) {
-    if (!g_injected_proc || !g_remote_dll_base) return;
-
-    DWORD proc_code = 0;
-    if (GetExitCodeProcess(g_injected_proc, &proc_code) && proc_code != STILL_ACTIVE) {
-        return;
-    }
-
-    static uintptr_t s_rehook_offset = 0;
-    if (s_rehook_offset == 0) {
-        /* Load purely as a data/export image without executing DllMain */
-        HMODULE hMod = LoadLibraryExA("C:\\xpdash\\xpdash-hook9.dll", NULL, DONT_RESOLVE_DLL_REFERENCES);
-        if (!hMod) hMod = LoadLibraryExA("C:\\xpdash\\xpdash-hook.dll", NULL, DONT_RESOLVE_DLL_REFERENCES);
-        if (hMod) {
-            FARPROC pFn = GetProcAddress(hMod, "install_d3d9_hooks");
-            if (pFn) {
-                s_rehook_offset = (uintptr_t)pFn - (uintptr_t)hMod;
-            }
-            FreeLibrary(hMod);
-        }
-    }
-
-    if (s_rehook_offset != 0) {
-        LPTHREAD_START_ROUTINE pRemote = (LPTHREAD_START_ROUTINE)((uintptr_t)g_remote_dll_base + s_rehook_offset);
-        HANDLE hThread = CreateRemoteThread(g_injected_proc, NULL, 0, pRemote, NULL, 0, NULL);
-        if (hThread) {
-            WaitForSingleObject(hThread, 1500);
-            DWORD exit_code = 0;
-            GetExitCodeThread(hThread, &exit_code);
-            CloseHandle(hThread);
-            agent_log("d3d9hook: remote install_d3d9_hooks returned %lu", (unsigned long)exit_code);
-        }
-    }
-}
-
 /* ─── Frame Reading ───────────────────────────────────────────────────── */
 
 int d3d9hook_is_active(void) {
     if (!g_hook_cs_inited) return 0;
     EnterCriticalSection(&g_hook_cs);
 
-    /* If no process is currently injected, hook cannot be active! */
     if (!g_injected_proc) {
         if (g_shm_ptr) {
             close_shm_locked();
@@ -353,6 +374,7 @@ int d3d9hook_is_active(void) {
         LeaveCriticalSection(&g_hook_cs);
         return 0;
     }
+
     /* Try to open SHM if not already open */
     if (!g_shm_ptr) {
         if (!open_shm_locked()) {
@@ -362,17 +384,7 @@ int d3d9hook_is_active(void) {
     }
 
     HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
-    if (hdr->magic != 0x48443344) {
-        LeaveCriticalSection(&g_hook_cs);
-        return 0;
-    }
-    if (!hdr->hook_active) {
-        static DWORD s_last_rehook_try = 0;
-        DWORD now = timeGetTime();
-        if (g_injected_proc && now - s_last_rehook_try >= 1500) {
-            s_last_rehook_try = now;
-            d3d9hook_try_rehook();
-        }
+    if (hdr->magic != 0x48443344 || !hdr->hook_active) {
         LeaveCriticalSection(&g_hook_cs);
         return 0;
     }

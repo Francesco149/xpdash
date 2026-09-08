@@ -54,7 +54,9 @@ typedef struct {
     volatile uint32_t producer_seq;   /* incremented by hook on each frame */
     volatile uint32_t consumer_seq;   /* incremented by agent after reading */
     volatile uint32_t hook_active;    /* 1 = hook is installed and running */
-    uint8_t           reserved[24];   /* pad to 64 bytes */
+    volatile uint32_t present_rva;    /* RVA of Present in d3d9.dll (e.g. 0x40EA0) */
+    volatile uint32_t reset_rva;      /* RVA of Reset in d3d9.dll (e.g. 0x436B0) */
+    uint8_t           reserved[16];   /* pad to 64 bytes */
     /* Pixel data follows at offset 64 */
 } HookShmHeader;
 
@@ -72,16 +74,13 @@ typedef struct {
 
 typedef HRESULT (WINAPI *Present_t)(IDirect3DDevice9 *dev,
     const RECT *src, const RECT *dst, HWND hWnd, const RGNDATA *dirty);
-typedef HRESULT (WINAPI *EndScene_t)(IDirect3DDevice9 *dev);
 typedef HRESULT (WINAPI *Reset_t)(IDirect3DDevice9 *dev,
     D3DPRESENT_PARAMETERS *pp);
 
 /* ─── Globals ─────────────────────────────────────────────────────────── */
 
 static Present_t  g_orig_present  = NULL;
-static EndScene_t g_orig_endscene = NULL;
 static Reset_t    g_orig_reset    = NULL;
-static void     **g_hooked_vtable = NULL;
 static HANDLE  g_shm_handle = NULL;
 static void   *g_shm_ptr    = NULL;
 static HANDLE  g_frame_event = NULL;  /* signaled when a frame is ready */
@@ -116,12 +115,15 @@ static int shm_init(void) {
     g_ack_event   = CreateEventA(NULL, FALSE, FALSE, XPDASH_HOOK_ACK_NAME);
     if (!g_frame_event || !g_ack_event) return 0;
 
-    /* Initialize header */
+    /* Initialize header, preserving present_rva / reset_rva if already set by agent */
     HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+    uint32_t saved_present_rva = (hdr->magic == 0x48443344) ? hdr->present_rva : 0;
+    uint32_t saved_reset_rva   = (hdr->magic == 0x48443344) ? hdr->reset_rva : 0;
     memset(hdr, 0, SHM_HEADER_SIZE);
     hdr->magic = 0x48443344;  /* 'D3DH' */
-    hdr->hook_active = 1;
-
+    hdr->present_rva = saved_present_rva;
+    hdr->reset_rva   = saved_reset_rva;
+    hdr->hook_active = 0;
     return 1;
 }
 
@@ -359,157 +361,136 @@ static HRESULT WINAPI hook_reset(IDirect3DDevice9 *dev,
     return g_orig_reset(dev, pp);
 }
 
-/* ─── Vtable Hooking ──────────────────────────────────────────────────── */
+/* ─── Microsoft Hotpatch Detours ───────────────────────────────────────── */
 
-static int hook_vtable(void **vtable, int index, void *hook, void **original) {
-    DWORD old_protect;
-    if (!VirtualProtect(&vtable[index], sizeof(void *),
-                        PAGE_EXECUTE_READWRITE, &old_protect))
+static uint8_t  g_present_trampoline[8];
+static uint8_t  g_reset_trampoline[8];
+static uint8_t *g_hooked_present_addr = NULL;
+static uint8_t *g_hooked_reset_addr = NULL;
+static uint8_t  g_orig_present_bytes[5];
+static uint8_t  g_orig_reset_bytes[5];
+
+static int install_hotpatch(void *target, void *hook, uint8_t *trampoline, void **p_orig, uint8_t *saved_bytes) {
+    uint8_t *p = (uint8_t *)target;
+    if (IsBadReadPtr(p, 5)) {
+        hook_log("install_hotpatch: target %p is unreadable memory", target);
         return 0;
+    }
+    /* Verify standard Microsoft hotpatchable prologue:
+       8B FF    mov edi, edi
+       55       push ebp
+       8B EC    mov ebp, esp */
+    if (p[0] != 0x8B || p[1] != 0xFF || p[2] != 0x55 || p[3] != 0x8B || p[4] != 0xEC) {
+        hook_log("install_hotpatch: target %p does not match hotpatchable prologue (%02X %02X %02X %02X %02X)",
+                 target, p[0], p[1], p[2], p[3], p[4]);
+        return 0;
+    }
 
-    *original = vtable[index];
-    vtable[index] = hook;
+    memcpy(saved_bytes, p, 5);
 
-    VirtualProtect(&vtable[index], sizeof(void *), old_protect, &old_protect);
+    DWORD oldProtect;
+    if (!VirtualProtect(trampoline, 8, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        hook_log("install_hotpatch: VirtualProtect on trampoline failed, err=%lu", GetLastError());
+        return 0;
+    }
+
+    /* Trampoline executes:
+       push ebp        (0x55)
+       mov ebp, esp    (0x8B 0xEC)
+       jmp p + 5       (0xE9 rel32) */
+    trampoline[0] = 0x55;
+    trampoline[1] = 0x8B;
+    trampoline[2] = 0xEC;
+    trampoline[3] = 0xE9;
+    uint32_t rel_trampoline = (uint32_t)((p + 5) - (&trampoline[3] + 5));
+    memcpy(&trampoline[4], &rel_trampoline, 4);
+    *p_orig = (void *)trampoline;
+
+    /* Overwrite target prologue: jmp hook (0xE9 rel32) */
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        hook_log("install_hotpatch: VirtualProtect on target failed, err=%lu", GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    uint32_t rel_hook = (uint32_t)((uint8_t *)hook - (p + 5));
+    memcpy(&p[1], &rel_hook, 4);
+    VirtualProtect(p, 5, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, 8);
     return 1;
 }
 
 static int install_hooks(void) {
-    hook_log("install_hooks: starting hook installation in PID %lu", GetCurrentProcessId());
+    hook_log("install_hooks: installing hotpatch detours in PID %lu", GetCurrentProcessId());
 
-    /* Method 1: Direct check for RenderWare games (GTA San Andreas v1.0) */
-    IDirect3DDevice9 **ppDev = (IDirect3DDevice9 **)0x00C97C28;
-    if (!IsBadReadPtr(ppDev, sizeof(void *)) && *ppDev != NULL) {
-        IDirect3DDevice9 *dev = *ppDev;
-        if (!IsBadReadPtr(dev, sizeof(void *))) {
-            void **vtable = *(void ***)dev;
-            if (!IsBadReadPtr(vtable, sizeof(void *) * 43)) {
-                hook_log("install_hooks: found active RenderWare D3D9 device at %p (vtable=%p)", dev, vtable);
-                g_hooked_vtable = vtable;
-                int ok = 1;
-                ok &= hook_vtable(vtable, VTBL_IDX_PRESENT, (void *)hook_present,
-                                  (void **)&g_orig_present);
-                ok &= hook_vtable(vtable, VTBL_IDX_RESET, (void *)hook_reset,
-                                  (void **)&g_orig_reset);
-                if (ok) {
-                    hook_log("install_hooks: RenderWare D3D9 device hooked successfully (orig_present=%p)",
-                             g_orig_present);
-                    return 1;
-                } else {
-                    hook_log("install_hooks: hook_vtable failed for RenderWare device");
-                }
-            }
-        }
-    }
-
-    /* Method 2: Temporary D3D9 device creation (windowed apps & desktop fallback) */
-    hook_log("install_hooks: attempting dummy device creation");
-    HMODULE hd3d9 = LoadLibraryA("d3d9.dll");
+    HMODULE hd3d9 = GetModuleHandleA("d3d9.dll");
+    if (!hd3d9) hd3d9 = LoadLibraryA("d3d9.dll");
     if (!hd3d9) {
-        hook_log("install_hooks: LoadLibraryA(d3d9.dll) failed, err=%lu", GetLastError());
+        hook_log("install_hooks: d3d9.dll not found in process");
         return 0;
     }
 
-    typedef IDirect3D9 *(WINAPI *Direct3DCreate9_t)(UINT SDKVersion);
-    Direct3DCreate9_t pCreate9 = (Direct3DCreate9_t)GetProcAddress(hd3d9, "Direct3DCreate9");
-    if (!pCreate9) {
-        hook_log("install_hooks: GetProcAddress(Direct3DCreate9) failed");
+    uint32_t present_rva = 0x40EA0;
+    uint32_t reset_rva   = 0x436B0;
+    if (g_shm_ptr) {
+        HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+        if (hdr->present_rva != 0) present_rva = hdr->present_rva;
+        if (hdr->reset_rva != 0)   reset_rva   = hdr->reset_rva;
+    }
+
+    uint8_t *pPresent = (uint8_t *)((uintptr_t)hd3d9 + present_rva);
+    uint8_t *pReset   = (uint8_t *)((uintptr_t)hd3d9 + reset_rva);
+
+    int ok_present = install_hotpatch(pPresent, (void *)hook_present, g_present_trampoline,
+                                      (void **)&g_orig_present, g_orig_present_bytes);
+    if (!ok_present) {
+        hook_log("install_hooks: hotpatching Present at %p (RVA 0x%lX) failed",
+                 pPresent, (unsigned long)present_rva);
         return 0;
     }
+    g_hooked_present_addr = pPresent;
+    hook_log("install_hooks: Present hotpatched successfully at %p (orig_present=%p)",
+             pPresent, g_orig_present);
 
-    IDirect3D9 *d3d9 = pCreate9(D3D_SDK_VERSION);
-    if (!d3d9) {
-        hook_log("install_hooks: Direct3DCreate9 failed");
-        return 0;
-    }
-
-    HWND hwnd = CreateWindowExA(0, "STATIC", "xpdash_hook_tmp",
-                                WS_OVERLAPPEDWINDOW, 0, 0, 1, 1,
-                                NULL, NULL, GetModuleHandle(NULL), NULL);
-    if (!hwnd) {
-        hwnd = GetDesktopWindow();
-        hook_log("install_hooks: CreateWindowExA failed, using GetDesktopWindow=%p", hwnd);
-    }
-
-    D3DPRESENT_PARAMETERS pp;
-    memset(&pp, 0, sizeof(pp));
-    pp.Windowed = TRUE;
-    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.BackBufferCount = 1;
-    pp.hDeviceWindow = hwnd;
-
-    D3DDISPLAYMODE d3ddm;
-    if (SUCCEEDED(d3d9->lpVtbl->GetAdapterDisplayMode(d3d9, D3DADAPTER_DEFAULT, &d3ddm))) {
-        pp.BackBufferFormat = d3ddm.Format;
+    int ok_reset = install_hotpatch(pReset, (void *)hook_reset, g_reset_trampoline,
+                                    (void **)&g_orig_reset, g_orig_reset_bytes);
+    if (ok_reset) {
+        g_hooked_reset_addr = pReset;
+        hook_log("install_hooks: Reset hotpatched successfully at %p (orig_reset=%p)",
+                 pReset, g_orig_reset);
     } else {
-        pp.BackBufferFormat = D3DFMT_A8R8G8B8;
-    }
-    IDirect3DDevice9 *dev = NULL;
-    HRESULT hr = d3d9->lpVtbl->CreateDevice(
-        d3d9, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
-        D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
-    hook_log("install_hooks: CreateDevice(HAL) hr=0x%08lX, dev=%p", (unsigned long)hr, dev);
-    if (FAILED(hr) || !dev) {
-        hr = d3d9->lpVtbl->CreateDevice(
-            d3d9, D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, hwnd,
-            D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
-        hook_log("install_hooks: CreateDevice(NULLREF) hr=0x%08lX, dev=%p", (unsigned long)hr, dev);
-        if (FAILED(hr) || !dev) {
-            d3d9->lpVtbl->Release(d3d9);
-            if (hwnd && hwnd != GetDesktopWindow()) DestroyWindow(hwnd);
-            return 0;
-        }
+        hook_log("install_hooks: Reset hotpatch failed (will continue with Present hook only)");
     }
 
-    void **vtable = *(void ***)dev;
-    hook_log("install_hooks: dummy device created, vtable=%p", vtable);
-
-    g_hooked_vtable = vtable;
-    int ok = 1;
-    ok &= hook_vtable(vtable, VTBL_IDX_PRESENT, (void *)hook_present,
-                      (void **)&g_orig_present);
-    ok &= hook_vtable(vtable, VTBL_IDX_RESET, (void *)hook_reset,
-                      (void **)&g_orig_reset);
-    dev->lpVtbl->Release(dev);
-    d3d9->lpVtbl->Release(d3d9);
-    if (hwnd && hwnd != GetDesktopWindow()) DestroyWindow(hwnd);
-
-    hook_log("install_hooks: dummy device hooking result=%d (orig_present=%p)", ok, g_orig_present);
-    return ok;
+    return 1;
 }
 
 static void remove_hooks(void) {
-    /* Restore original function pointers so process continues cleanly */
-    if (g_hooked_vtable && g_orig_present) {
-        DWORD old_protect;
-        if (VirtualProtect(&g_hooked_vtable[VTBL_IDX_PRESENT], sizeof(void *),
-                            PAGE_EXECUTE_READWRITE, &old_protect)) {
-            g_hooked_vtable[VTBL_IDX_PRESENT] = (void *)g_orig_present;
-            VirtualProtect(&g_hooked_vtable[VTBL_IDX_PRESENT], sizeof(void *),
-                            old_protect, &old_protect);
+    DWORD oldProtect;
+    if (g_hooked_present_addr) {
+        if (VirtualProtect(g_hooked_present_addr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            memcpy(g_hooked_present_addr, g_orig_present_bytes, 5);
+            VirtualProtect(g_hooked_present_addr, 5, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), g_hooked_present_addr, 5);
         }
+        g_hooked_present_addr = NULL;
     }
-    if (g_hooked_vtable && g_orig_reset) {
-        DWORD old_protect;
-        if (VirtualProtect(&g_hooked_vtable[VTBL_IDX_RESET], sizeof(void *),
-                            PAGE_EXECUTE_READWRITE, &old_protect)) {
-            g_hooked_vtable[VTBL_IDX_RESET] = (void *)g_orig_reset;
-            VirtualProtect(&g_hooked_vtable[VTBL_IDX_RESET], sizeof(void *),
-                            old_protect, &old_protect);
+    if (g_hooked_reset_addr) {
+        if (VirtualProtect(g_hooked_reset_addr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            memcpy(g_hooked_reset_addr, g_orig_reset_bytes, 5);
+            VirtualProtect(g_hooked_reset_addr, 5, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), g_hooked_reset_addr, 5);
         }
+        g_hooked_reset_addr = NULL;
     }
-    hook_log("remove_hooks: vtable restored cleanly");
-    g_hooked_vtable = NULL;
-    g_orig_present  = NULL;
-    g_orig_endscene = NULL;
-    g_orig_reset    = NULL;
+    hook_log("remove_hooks: hotpatch detours restored cleanly");
 }
-/* ─── DLL Entry Point ─────────────────────────────────────────────────── */
 
-static HANDLE g_init_thread = NULL;
-static volatile int g_stop_init_thread = 0;
+/* ─── DLL Exports & Entry Point ───────────────────────────────────────── */
+
 __declspec(dllexport) int install_d3d9_hooks(void) {
-    if (g_initialized && g_hooked_vtable) return 1;
+    if (g_initialized && g_hooked_present_addr) return 1;
     if (install_hooks()) {
         HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
         if (hdr) hdr->hook_active = 1;
@@ -519,30 +500,6 @@ __declspec(dllexport) int install_d3d9_hooks(void) {
     return 0;
 }
 
-static DWORD WINAPI hook_init_thread(LPVOID param) {
-    (void)param;
-
-    hook_log("hook_init_thread: background init loop started");
-
-    /* Retry install_hooks() periodically until the game initializes its D3D9 device.
-       Games take between 1 to 15 seconds to create their device after launch. */
-    for (int retry = 0; retry < 150 && !g_stop_init_thread; retry++) {
-        Sleep(200);
-        if (g_stop_init_thread) break;
-        if (install_hooks()) {
-            HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
-            if (hdr) hdr->hook_active = 1;
-            g_initialized = 1;
-            hook_log("hook_init_thread: successfully hooked after %dms", (retry + 1) * 200);
-            return 0;
-        }
-    }
-
-    hook_log("hook_init_thread: gave up after 30s, hook inactive");
-    HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
-    if (hdr) hdr->hook_active = 0;
-    return 1;
-}
 BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpReserved) {
     (void)lpReserved;
 
@@ -553,7 +510,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpReserved) {
         char proc_name[MAX_PATH];
         GetModuleFileNameA(NULL, proc_name, sizeof(proc_name));
         if (strstr(proc_name, "xpdash-agent.exe") || strstr(proc_name, "xpdash-agent")) {
-            /* Never initialize hook or threads if loaded inside xpdash-agent */
+            /* Never initialize hook inside xpdash-agent */
             return TRUE;
         }
 
@@ -561,14 +518,10 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpReserved) {
 
         if (!shm_init()) return FALSE;
 
-        /* Defer hook installation — DllMain cannot call LoadLibrary,
-           create COM objects, or do anything that acquires the loader lock.
-           We spawn a thread that will install hooks after DllMain returns. */
-        g_stop_init_thread = 0;
-        g_init_thread = CreateThread(NULL, 0, hook_init_thread, NULL, 0, NULL);
-        if (!g_init_thread) {
-            shm_shutdown();
-            return FALSE;
+        if (install_hooks()) {
+            HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+            if (hdr) hdr->hook_active = 1;
+            g_initialized = 1;
         }
         break;
     }
@@ -580,13 +533,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpReserved) {
             return TRUE;
         }
 
-        g_stop_init_thread = 1;
-        if (g_init_thread) {
-            /* Wait briefly for init thread to finish */
-            WaitForSingleObject(g_init_thread, 500);
-            CloseHandle(g_init_thread);
-            g_init_thread = NULL;
-        }
         if (g_initialized) {
             remove_hooks();
             release_sysmem_surf();
