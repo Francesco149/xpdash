@@ -45,11 +45,18 @@ static void vblank_init(void) {
 
 static int g_vblank_disabled = 0;
 static int g_target_fps = 60;
-static int g_desktop_fps = 20;
+static int g_desktop_fps = 60;
+static int g_fallback_fps = 20;
 static int g_jpeg_quality = 85;
 static char g_adapter_name[128] = "Unknown";
 static int g_is_accelerated = 1;
 
+static int get_effective_desktop_fps(void) {
+    if (!g_is_accelerated) {
+        return g_fallback_fps; // 20 FPS degraded fallback on unaccelerated/VGA drivers
+    }
+    return (g_desktop_fps > 0) ? g_desktop_fps : g_target_fps;
+}
 static void check_display_driver_acceleration(void) {
     DISPLAY_DEVICEA dd;
     memset(&dd, 0, sizeof(dd));
@@ -76,9 +83,9 @@ static void check_display_driver_acceleration(void) {
         agent_log("================================================================");
         agent_log("WARNING: UNACCELERATED OR FALLBACK DISPLAY DRIVER DETECTED!");
         agent_log("Display Adapter: '%s'", g_adapter_name);
-        agent_log("Running in software fallback mode with degraded GDI performance.");
+        agent_log("Running in software fallback mode (capping desktop at %d FPS to protect CPU).", g_fallback_fps);
         agent_log("Install official GPU drivers (ATI Catalyst / NVIDIA ForceWare) to");
-        agent_log("enable hardware Direct3D/DirectDraw acceleration and 60 FPS streaming.");
+        agent_log("enable hardware Direct3D/DirectDraw acceleration and full 60 FPS streaming.");
         agent_log("================================================================");
     }
 }
@@ -231,11 +238,12 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
             /* Frame pacing: ensure we never busy-spin the CPU */
             if (!s_in_hook_mode || g_vblank_disabled) {
                 DWORD elapsed = timeGetTime() - t_start;
+                int eff_fps = get_effective_desktop_fps();
+                DWORD frame_interval = (eff_fps > 0) ? (1000 / eff_fps) : 16;
                 if (elapsed < frame_interval) {
                     Sleep(frame_interval - elapsed);
                 } else {
-                    /* On slower PCIe readback systems, sleep at least 33ms between desktop BitBlts to yield CPU */
-                    Sleep(33);
+                    Sleep(2);
                 }
             }
         } else {
@@ -448,15 +456,15 @@ int video_init(video_frame_cb callback, void *user_data) {
     g_target_fps = GetPrivateProfileIntA("video", "target_fps", 60, "C:\\xpdash\\agent.ini");
     if (g_target_fps <= 0 || g_target_fps > 120) g_target_fps = 60;
 
-    g_desktop_fps = GetPrivateProfileIntA("video", "desktop_fps", 20, "C:\\xpdash\\agent.ini");
-    if (g_desktop_fps <= 0 || g_desktop_fps > 60) g_desktop_fps = 20;
-
+    g_desktop_fps = GetPrivateProfileIntA("video", "desktop_fps", g_target_fps, "C:\\xpdash\\agent.ini");
+    if (g_desktop_fps <= 0 || g_desktop_fps > 120) g_desktop_fps = g_target_fps;
     g_jpeg_quality = GetPrivateProfileIntA("video", "jpeg_quality", 85, "C:\\xpdash\\agent.ini");
     if (g_jpeg_quality < 30 || g_jpeg_quality > 100) g_jpeg_quality = 85;
 
     check_display_driver_acceleration();
-    agent_log("video_init: capture_layered=%d, target_fps=%d, desktop_fps=%d, jpeg_quality=%d",
-              g_capture_layered, g_target_fps, g_desktop_fps, g_jpeg_quality);
+    int eff_fps = get_effective_desktop_fps();
+    agent_log("video_init: capture_layered=%d, target_fps=%d, desktop_fps=%d (effective=%d), jpeg_quality=%d",
+              g_capture_layered, g_target_fps, g_desktop_fps, eff_fps, g_jpeg_quality);
     int w = GetSystemMetrics(SM_CXSCREEN);
     int h = GetSystemMetrics(SM_CYSCREEN);
     agent_log("video_init: GetSystemMetrics = %dx%d", w, h);
@@ -647,7 +655,8 @@ int video_capture(void) {
            BitBlt with CAPTUREBLT takes ~120ms. We pace full VRAM readbacks at ~25 FPS (every 40ms)
            to capture window and layered window updates without locking win32k.sys.
            Cursor movements between BitBlt passes are rendered instantly via restore_cursor_rect(). */
-        DWORD desktop_interval = (g_desktop_fps > 0) ? (1000 / g_desktop_fps) : 50;
+        int eff_fps = get_effective_desktop_fps();
+        DWORD desktop_interval = (eff_fps > 0) ? (1000 / eff_fps) : 16;
         int should_blt = g_force_keyframe || (!s_last_blt_finish_time) || (now - s_last_blt_finish_time >= desktop_interval);
         if (should_blt) {
             DWORD rop = SRCCOPY;
