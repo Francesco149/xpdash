@@ -209,14 +209,16 @@ static int ensure_resolve_surf(IDirect3DDevice9 *dev, uint32_t w, uint32_t h, D3
 
 static void capture_backbuffer(IDirect3DDevice9 *dev) {
     if (!g_shm_ptr || !g_frame_event) {
-        static int s_logged_no_shm = 0;
-        if (!s_logged_no_shm) {
-            hook_log("capture_backbuffer: no SHM (%p) or frame_event (%p)", g_shm_ptr, g_frame_event);
-            s_logged_no_shm = 1;
-        }
         return;
     }
 
+    HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+
+    /* Flow control: If agent has not consumed previous frame yet,
+       skip expensive GPU readback so game render thread does not stall */
+    if (hdr->producer_seq != hdr->consumer_seq) {
+        return;
+    }
     IDirect3DSurface9 *back_buf = NULL;
     HRESULT hr = dev->lpVtbl->GetBackBuffer(dev, 0, 0,
                                              D3DBACKBUFFER_TYPE_MONO, &back_buf);
@@ -306,7 +308,6 @@ static void capture_backbuffer(IDirect3DDevice9 *dev) {
         return;
     }
 
-    HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
     uint8_t *pixel_dst = (uint8_t *)g_shm_ptr + SHM_HEADER_SIZE;
 
     /* Copy pixel data row by row (pitch may differ from width*4) */
@@ -370,14 +371,24 @@ static HRESULT WINAPI hook_present(IDirect3DDevice9 *dev,
 static HRESULT WINAPI hook_reset(IDirect3DDevice9 *dev,
     D3DPRESENT_PARAMETERS *pp)
 {
-    hook_log("hook_reset: game resetting device %p (%ux%u)",
-             dev, pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+    hook_log("hook_reset: game resetting device %p (%ux%u, interval=0x%lx)",
+             dev, pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0,
+             pp ? (unsigned long)pp->PresentationInterval : 0);
+
+    /* Decouple VSync on device reset to prevent 30/20 FPS quantization */
+    if (pp) {
+        if (pp->PresentationInterval == D3DPRESENT_INTERVAL_DEFAULT ||
+            pp->PresentationInterval == D3DPRESENT_INTERVAL_ONE) {
+            hook_log("hook_reset: uncoupling VSync: overriding PresentationInterval from 0x%lx to D3DPRESENT_INTERVAL_IMMEDIATE",
+                     (unsigned long)pp->PresentationInterval);
+            pp->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+        }
+    }
 
     /* Release D3D resources before Reset so D3D9 Reset() doesn't fail with D3DERR_DEVICELOST */
     EnterCriticalSection(&g_cs);
     release_sysmem_surf();
     LeaveCriticalSection(&g_cs);
-
     HRESULT hr = g_orig_reset(dev, pp);
     hook_log("hook_reset: Reset returned 0x%08lX", (unsigned long)hr);
     return hr;
@@ -388,9 +399,20 @@ static HRESULT WINAPI hook_create_device(IDirect3D9 *d3d, UINT Adapter, D3DDEVTY
                                          D3DPRESENT_PARAMETERS *pp,
                                          IDirect3DDevice9 **ppDev)
 {
-    hook_log("hook_create_device: game creating D3D9 device (type=%u, flags=0x%lx, res=%ux%u)",
+    hook_log("hook_create_device: game creating D3D9 device (type=%u, flags=0x%lx, res=%ux%u, interval=0x%lx)",
              (unsigned int)DeviceType, (unsigned long)BehaviorFlags,
-             pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0);
+             pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0,
+             pp ? (unsigned long)pp->PresentationInterval : 0);
+
+    /* Decouple VSync on device creation to prevent 30/20 FPS quantization */
+    if (pp) {
+        if (pp->PresentationInterval == D3DPRESENT_INTERVAL_DEFAULT ||
+            pp->PresentationInterval == D3DPRESENT_INTERVAL_ONE) {
+            hook_log("hook_create_device: uncoupling VSync: overriding PresentationInterval from 0x%lx to D3DPRESENT_INTERVAL_IMMEDIATE",
+                     (unsigned long)pp->PresentationInterval);
+            pp->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+        }
+    }
 
     /* Release any surfaces from older devices so the old device is fully freed in COM */
     EnterCriticalSection(&g_cs);

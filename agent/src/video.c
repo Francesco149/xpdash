@@ -227,7 +227,7 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
             /* If actively receiving D3D9 hook frames, frame rate is driven
                by Present() via d3d9hook_read_frame's internal event wait.
                Otherwise, wait for hardware VBlank or pace via multimedia timer. */
-            if (!s_in_hook_mode) {
+            if (!s_in_hook_mode && !d3d9hook_is_active()) {
                 if (g_pdd && !g_vblank_disabled) {
                     vblank_wait();
                 }
@@ -235,8 +235,9 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
 
             video_capture();
 
-            /* Frame pacing: ensure we never busy-spin the CPU */
-            if (!s_in_hook_mode || g_vblank_disabled) {
+            /* Frame pacing: only sleep on desktop; in hook mode, frame rate
+               is paced directly by the game's Present() event wait */
+            if (!s_in_hook_mode) {
                 DWORD elapsed = timeGetTime() - t_start;
                 int eff_fps = get_effective_desktop_fps();
                 DWORD frame_interval = (eff_fps > 0) ? (1000 / eff_fps) : 16;
@@ -602,14 +603,14 @@ int video_capture(void) {
     int screen_w = GetSystemMetrics(SM_CXSCREEN);
     int screen_h = GetSystemMetrics(SM_CYSCREEN);
     int cur_bpp = GetDeviceCaps(g_hdc_screen, BITSPIXEL) * GetDeviceCaps(g_hdc_screen, PLANES);
-    if (screen_w > 0 && screen_h > 0 &&
+    /* Only check and adapt to desktop screen resolution if D3D9 hook is not active */
+    if (!d3d9hook_is_active() && screen_w > 0 && screen_h > 0 &&
         (g_width != screen_w || g_height != screen_h || g_bpp != cur_bpp)) {
         agent_log("video_capture: screen display changed to %dx%d@%d", screen_w, screen_h, cur_bpp);
         video_resize(screen_w, screen_h);
         net_send_video_resize((uint16_t)screen_w, (uint16_t)screen_h, (uint8_t)cur_bpp);
         video_force_keyframe();
     }
-
     if (!g_hdc_screen || !g_hdc_mem || !g_pixels || !g_comp_buf) {
         static int s_logged_null = 0;
         if (!s_logged_null) {

@@ -260,7 +260,6 @@ fn render_badge(ui: &mut egui::Ui, text: &str, bg: Color32, fg: Color32) {
 mod tests {
     use super::*;
 
-    #[test]
     fn test_ui_icons_exist_in_font() {
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |_| {});

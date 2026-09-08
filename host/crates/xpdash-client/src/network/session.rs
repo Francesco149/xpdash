@@ -290,7 +290,7 @@ async fn run_media_receiver(
         compressed_data: Vec<u8>,
     }
 
-    let (decompress_tx, mut decompress_rx) = tokio::sync::mpsc::channel::<CompressedFrame>(2);
+    let (decompress_tx, mut decompress_rx) = tokio::sync::mpsc::channel::<CompressedFrame>(8);
     let frame_sink = latest_frame.clone();
     let metrics_worker = metrics.clone();
 
@@ -302,26 +302,14 @@ async fn run_media_receiver(
             let mut rgba: Option<Vec<u8>> = None;
 
             if item.codec == 1 {
-                // JPEG decode (TurboJPEG from agent)
+                // Direct SIMD JPEG decode to RGBA (bypasses manual scalar conversion)
+                let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+                    .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA);
                 let cursor = Cursor::new(&item.compressed_data[..]);
-                let mut decoder = JpegDecoder::new(cursor);
+                let mut decoder = JpegDecoder::new_with_options(cursor, options);
                 match decoder.decode() {
                     Ok(pixels) => {
-                        // zune-jpeg decodes to RGB by default; convert to RGBA
-                        let pixel_count = (item.width as usize) * (item.height as usize);
-                        if pixels.len() >= pixel_count * 3 {
-                            let mut out = Vec::with_capacity(pixel_count * 4);
-                            for chunk in pixels.chunks_exact(3) {
-                                out.push(chunk[0]); // R
-                                out.push(chunk[1]); // G
-                                out.push(chunk[2]); // B
-                                out.push(255);      // A
-                            }
-                            rgba = Some(out);
-                        } else {
-                            log::warn!("JPEG decode size mismatch: got {} bytes, expected {} ({}x{})",
-                                pixels.len(), pixel_count * 3, item.width, item.height);
-                        }
+                        rgba = Some(pixels);
                     }
                     Err(e) => {
                         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
