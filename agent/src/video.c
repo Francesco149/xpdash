@@ -14,36 +14,7 @@
 #define CAPTUREBLT 0x40000000
 #endif
 
-static HMODULE g_h_ddraw = NULL;
-static LPDIRECTDRAW g_pdd = NULL;
 static int g_capture_layered = 1; // Default to 1 (CAPTUREBLT) for capturing Rainmeter & transparent windows
-static void vblank_init(void) {
-    if (g_pdd) return;
-    g_h_ddraw = LoadLibraryA("ddraw.dll");
-    if (!g_h_ddraw) {
-        agent_log("vblank_init: LoadLibraryA(ddraw.dll) failed, err=%lu", GetLastError());
-        return;
-    }
-
-    typedef HRESULT (WINAPI *DirectDrawCreate_fn)(GUID *lpGUID, LPDIRECTDRAW *lplpDD, IUnknown *pUnkOuter);
-    DirectDrawCreate_fn pfnDirectDrawCreate = (DirectDrawCreate_fn)GetProcAddress(g_h_ddraw, "DirectDrawCreate");
-    if (!pfnDirectDrawCreate) {
-        agent_log("vblank_init: GetProcAddress(DirectDrawCreate) failed, err=%lu", GetLastError());
-        return;
-    }
-
-    LPDIRECTDRAW pdd = NULL;
-    HRESULT hr = pfnDirectDrawCreate(NULL, &pdd, NULL);
-    if (FAILED(hr) || !pdd) {
-        agent_log("vblank_init: DirectDrawCreate failed hr=0x%08lX", (unsigned long)hr);
-        return;
-    }
-    pdd->lpVtbl->SetCooperativeLevel(pdd, NULL, DDSCL_NORMAL);
-    g_pdd = pdd;
-    agent_log("vblank_init: DirectDraw hardware VSync synchronization initialized (pdd=%p)", g_pdd);
-}
-
-static int g_vblank_disabled = 0;
 static int g_target_fps = 60;
 static int g_desktop_fps = 60;
 static int g_fallback_fps = 20;
@@ -87,24 +58,6 @@ static void check_display_driver_acceleration(void) {
         agent_log("Install official GPU drivers (ATI Catalyst / NVIDIA ForceWare) to");
         agent_log("enable hardware Direct3D/DirectDraw acceleration and full 60 FPS streaming.");
         agent_log("================================================================");
-    }
-}
-static void vblank_wait(void) {
-    if (g_pdd && !g_vblank_disabled) {
-        /* Wait for the next vertical blanking interval to begin.
-           During VBlank the front buffer is stable — Present() has
-           completed and the game hasn't started drawing the next frame. */
-        HRESULT hr = g_pdd->lpVtbl->WaitForVerticalBlank(g_pdd, DDWAITVB_BLOCKBEGIN, NULL);
-        if (FAILED(hr)) {
-            static int s_logged_vb_fail = 0;
-            if (!s_logged_vb_fail) {
-                agent_log("vblank_wait: WaitForVerticalBlank failed hr=0x%08lX; disabling DirectDraw VSync (falling back to multimedia timer pacing)", (unsigned long)hr);
-                s_logged_vb_fail = 1;
-            }
-            g_vblank_disabled = 1;
-            g_pdd->lpVtbl->Release(g_pdd);
-            g_pdd = NULL;
-        }
     }
 }
 
@@ -182,7 +135,6 @@ static RECT s_last_cursor_rect = { 0, 0, 0, 0 };
 static int s_has_cursor_rect = 0;
 static POINT s_last_cursor_pos = { -1, -1 };
 static DWORD s_last_cursor_flags = 0;
-static DWORD s_last_blt_finish_time = 0;
 /* Restore the 32x32 pixel area under the previous cursor from g_prev_pixels
    without calling BitBlt across the PCIe bus (takes 0.001ms instead of 120ms) */
 static void restore_cursor_rect(void) {
@@ -224,19 +176,10 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
         if (net_is_streaming_active()) {
             DWORD t_start = timeGetTime();
 
-            /* If actively receiving D3D9 hook frames, frame rate is driven
-               by Present() via d3d9hook_read_frame's internal event wait.
-               Otherwise, wait for hardware VBlank or pace via multimedia timer. */
-            if (!s_in_hook_mode && !d3d9hook_is_active()) {
-                if (g_pdd && !g_vblank_disabled) {
-                    vblank_wait();
-                }
-            }
-
+            /* Frame capture: in hook mode, timing is driven by game's Present().
+               On desktop, frame rate is paced via high-resolution multimedia timer. */
             video_capture();
 
-            /* Frame pacing: only sleep on desktop; in hook mode, frame rate
-               is paced directly by the game's Present() event wait */
             if (!s_in_hook_mode) {
                 DWORD elapsed = timeGetTime() - t_start;
                 int eff_fps = get_effective_desktop_fps();
@@ -244,7 +187,7 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
                 if (elapsed < frame_interval) {
                     Sleep(frame_interval - elapsed);
                 } else {
-                    Sleep(2);
+                    Sleep(0);
                 }
             }
         } else {
@@ -439,7 +382,6 @@ int video_init(video_frame_cb callback, void *user_data) {
 
     g_hdc_mem = CreateCompatibleDC(g_hdc_screen);
     agent_log("video_init: CreateCompatibleDC = %p", g_hdc_mem);
-    vblank_init();
     /* Initialize TurboJPEG compressor for JPEG video encoding */
     g_tj = tjInitCompress();
     if (!g_tj) {
@@ -481,24 +423,16 @@ static int is_screen_dirty(void) {
     int total_pixels = g_width * g_height;
 
     int rgb_diff = 0;
-    int alpha_only_diff = 0;
     for (int i = 0; i < total_pixels; i++) {
         uint32_t diff = p1[i] ^ p2[i];
         if ((diff & 0x00FFFFFF) != 0) {
             rgb_diff++;
-        } else if (diff != 0) {
-            alpha_only_diff++;
+            if (rgb_diff > 16) {
+                return 1;
+            }
         }
     }
-
-    static int s_check_count = 0;
-    s_check_count++;
-    if ((s_check_count % 30) == 0) {
-        agent_log("is_screen_dirty: rgb_diff=%d, alpha_only_diff=%d (total=%d, threshold=16)",
-                  rgb_diff, alpha_only_diff, total_pixels);
-    }
-
-    return (rgb_diff > 16);
+    return 0;
 }
 
 int video_capture(void) {
@@ -652,34 +586,24 @@ int video_capture(void) {
             dst32[i] = lut[src8[i]];
         }
     } else {
-        /* Paced BitBlt: On PCIe-bound GDI readbacks (e.g. AMD Radeon on G41 chipset),
-           BitBlt with CAPTUREBLT takes ~120ms. We pace full VRAM readbacks at ~25 FPS (every 40ms)
-           to capture window and layered window updates without locking win32k.sys.
-           Cursor movements between BitBlt passes are rendered instantly via restore_cursor_rect(). */
-        int eff_fps = get_effective_desktop_fps();
-        DWORD desktop_interval = (eff_fps > 0) ? (1000 / eff_fps) : 16;
-        int should_blt = g_force_keyframe || (!s_last_blt_finish_time) || (now - s_last_blt_finish_time >= desktop_interval);
-        if (should_blt) {
-            DWORD rop = SRCCOPY;
-            if (g_capture_layered) rop |= CAPTUREBLT;
-            if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, rop)) {
-                // Fallback to plain SRCCOPY if CAPTUREBLT failed on an exotic driver
-                if ((rop & CAPTUREBLT) && BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
-                    static int s_logged_rop_fb = 0;
-                    if (!s_logged_rop_fb) {
-                        agent_log("video_capture: CAPTUREBLT failed, falling back to plain SRCCOPY");
-                        s_logged_rop_fb = 1;
-                    }
-                } else {
-                    static int s_logged_blt_fail = 0;
-                    if (!s_logged_blt_fail) {
-                        agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
-                        s_logged_blt_fail = 1;
-                    }
-                    return 0;
+        DWORD rop = SRCCOPY;
+        if (g_capture_layered) rop |= CAPTUREBLT;
+        if (!BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, rop)) {
+            // Fallback to plain SRCCOPY if CAPTUREBLT failed on an exotic driver
+            if ((rop & CAPTUREBLT) && BitBlt(g_hdc_mem, 0, 0, g_width, g_height, g_hdc_screen, 0, 0, SRCCOPY)) {
+                static int s_logged_rop_fb = 0;
+                if (!s_logged_rop_fb) {
+                    agent_log("video_capture: CAPTUREBLT failed, falling back to plain SRCCOPY");
+                    s_logged_rop_fb = 1;
                 }
+            } else {
+                static int s_logged_blt_fail = 0;
+                if (!s_logged_blt_fail) {
+                    agent_log("video_capture: BitBlt failed! err=%lu", GetLastError());
+                    s_logged_blt_fail = 1;
+                }
+                return 0;
             }
-            s_last_blt_finish_time = timeGetTime();
         }
     }
 
@@ -827,13 +751,5 @@ void video_shutdown(void) {
     if (g_hdc_screen) {
         ReleaseDC(NULL, g_hdc_screen);
         g_hdc_screen = NULL;
-    }
-    if (g_pdd) {
-        g_pdd->lpVtbl->Release(g_pdd);
-        g_pdd = NULL;
-    }
-    if (g_h_ddraw) {
-        FreeLibrary(g_h_ddraw);
-        g_h_ddraw = NULL;
     }
 }
