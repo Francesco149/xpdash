@@ -410,12 +410,14 @@ pub mod audio {
 }
 
 /// PTS-based Anti-Desync Clock Synchronization
+#[derive(Debug)]
 pub struct PtsClock {
     base_remote_pts: Option<u32>,
     base_local_instant: Option<Instant>,
     last_slew_instant: Instant,
     max_jitter_ms: u32,
     consecutive_late: u32,
+    smoothed_delta: f64,
 }
 
 impl PtsClock {
@@ -426,6 +428,7 @@ impl PtsClock {
             last_slew_instant: Instant::now(),
             max_jitter_ms,
             consecutive_late: 0,
+            smoothed_delta: 0.0,
         }
     }
 
@@ -434,17 +437,23 @@ impl PtsClock {
         self.base_local_instant = None;
         self.last_slew_instant = Instant::now();
         self.consecutive_late = 0;
+        self.smoothed_delta = 0.0;
     }
-    /// Check if packet with `pts_ms` is late or in sync.
+
+    /// Check if packet with `pts_ms` is late or in sync at current time.
     /// Returns `true` if frame is fresh/acceptable, `false` if late and should be dropped.
     pub fn is_packet_acceptable(&mut self, pts_ms: u32) -> bool {
-        let now = Instant::now();
+        self.is_packet_acceptable_at(pts_ms, Instant::now())
+    }
 
+    /// Check if packet with `pts_ms` is late or in sync at a given instant.
+    pub fn is_packet_acceptable_at(&mut self, pts_ms: u32, now: Instant) -> bool {
         if self.base_remote_pts.is_none() || self.base_local_instant.is_none() {
             self.base_remote_pts = Some(pts_ms);
             self.base_local_instant = Some(now);
             self.last_slew_instant = now;
             self.consecutive_late = 0;
+            self.smoothed_delta = 0.0;
             return true;
         }
 
@@ -454,7 +463,7 @@ impl PtsClock {
         let elapsed_local_ms = now.duration_since(base_local).as_millis() as u32;
         let expected_remote_pts = base_remote.wrapping_add(elapsed_local_ms);
 
-        let delta = pts_ms as i64 - expected_remote_pts as i64;
+        let delta = (pts_ms.wrapping_sub(expected_remote_pts)) as i32 as i64;
 
         // Check for large forward or backward timestamp jump (e.g. server restart)
         if delta > 300 || delta < -500 {
@@ -462,18 +471,20 @@ impl PtsClock {
             self.base_local_instant = Some(now);
             self.last_slew_instant = now;
             self.consecutive_late = 0;
+            self.smoothed_delta = 0.0;
             return true;
         }
 
         // Check if packet is late
         if delta < -(self.max_jitter_ms as i64) {
             self.consecutive_late += 1;
-            // If we receive sustained late packets, it's clock drift rather than network jitter: resync
+            // If we receive sustained late packets, it's clock drift or stream resume rather than network jitter: resync
             if self.consecutive_late >= 5 {
                 self.base_remote_pts = Some(pts_ms);
                 self.base_local_instant = Some(now);
                 self.last_slew_instant = now;
                 self.consecutive_late = 0;
+                self.smoothed_delta = 0.0;
                 return true;
             }
             // Isolated late packet: drop to preserve bounded latency
@@ -483,22 +494,38 @@ impl PtsClock {
         // Packet is on time
         self.consecutive_late = 0;
 
-        // Rate-limited baseline slew if remote clock runs faster than local clock.
-        // Max 1ms adjustment every 500ms prevents runaway drift while easily tracking crystal drift (~0.05ms/s).
-        if delta > 10 && now.duration_since(self.last_slew_instant) >= Duration::from_millis(500) {
-            self.base_remote_pts = Some(base_remote.wrapping_add(1));
-            self.last_slew_instant = now;
+        // Exponential moving average of delta to filter sub-slice offsets (±2.5ms) and network jitter
+        self.smoothed_delta = self.smoothed_delta * 0.95 + (delta as f64) * 0.05;
+
+        // Rate-limited bidirectional baseline slewing to track hardware crystal frequency offset.
+        // Slew baseline by 1ms whenever smoothed delta drifts by >= 1ms in either direction.
+        // Slew rate limit of 1ms per 100ms (10ms/s) tracks crystal drift (~0.05ms/s) with wide margin.
+        if now.duration_since(self.last_slew_instant) >= Duration::from_millis(100) {
+            if self.smoothed_delta >= 1.0 {
+                self.base_remote_pts = Some(base_remote.wrapping_add(1));
+                self.smoothed_delta -= 1.0;
+                self.last_slew_instant = now;
+            } else if self.smoothed_delta <= -1.0 {
+                self.base_remote_pts = Some(base_remote.wrapping_sub(1));
+                self.smoothed_delta += 1.0;
+                self.last_slew_instant = now;
+            }
         }
         true
     }
 
     /// Calculate the current packet jitter relative to expected clock (in milliseconds).
     pub fn jitter_ms(&self, pts_ms: u32) -> Option<i32> {
+        self.jitter_ms_at(pts_ms, Instant::now())
+    }
+
+    /// Calculate the current packet jitter relative to expected clock at a given instant.
+    pub fn jitter_ms_at(&self, pts_ms: u32, now: Instant) -> Option<i32> {
         let base_remote = self.base_remote_pts?;
         let base_local = self.base_local_instant?;
-        let elapsed_local_ms = Instant::now().duration_since(base_local).as_millis() as u32;
+        let elapsed_local_ms = now.duration_since(base_local).as_millis() as u32;
         let expected_remote_pts = base_remote.wrapping_add(elapsed_local_ms);
-        Some((pts_ms as i64 - expected_remote_pts as i64) as i32)
+        Some((pts_ms.wrapping_sub(expected_remote_pts)) as i32)
     }
 }
 
@@ -575,5 +602,126 @@ mod tests {
 
         // Large jump immediately resyncs
         assert!(clock.is_packet_acceptable(50000));
+    }
+
+    #[test]
+    fn test_pts_clock_negative_drift_soak() {
+        // Simulate 8 minutes (480s) of audio streaming where remote clock runs 11.4 ppm slower.
+        // Two slices per 10ms frame (sub 0 at +0ms, sub 1 at +5ms).
+        let mut clock = PtsClock::new(30);
+        let start_instant = Instant::now();
+        let start_pts = 100_000u32;
+        let total_frames = 48_000; // 480 seconds * 100 frames/sec
+        let mut dropped_slices = 0;
+        let mut jitter_sum = 0.0;
+        let mut jitter_count = 0;
+        let mut window_jitter_sum = 0.0;
+        let mut window_jitter_count = 0;
+        for frame in 0..total_frames {
+            let elapsed_ms = frame * 10;
+            let now = start_instant + Duration::from_millis(elapsed_ms as u64);
+            // Remote clock runs 11.4 ppm slower: loses ~5.5ms over 480,000ms
+            let remote_drift_ms = (elapsed_ms as f64 * 0.0000114) as u32;
+            let frame_pts = start_pts + elapsed_ms - remote_drift_ms;
+
+            // Sub-slice 0 (0..5ms)
+            let sub0_pts = frame_pts;
+            if let Some(j) = clock.jitter_ms_at(sub0_pts, now) {
+                jitter_sum += j.abs() as f64;
+                jitter_count += 1;
+                window_jitter_sum += j.abs() as f64;
+                window_jitter_count += 1;
+            }
+            if !clock.is_packet_acceptable_at(sub0_pts, now) {
+                dropped_slices += 1;
+            }
+
+            // Sub-slice 1 (5..10ms, arrives ~0.05ms after sub0)
+            let sub1_pts = frame_pts + 5;
+            if let Some(j) = clock.jitter_ms_at(sub1_pts, now) {
+                jitter_sum += j.abs() as f64;
+                jitter_count += 1;
+                window_jitter_sum += j.abs() as f64;
+                window_jitter_count += 1;
+            }
+            if !clock.is_packet_acceptable_at(sub1_pts, now) {
+                dropped_slices += 1;
+            }
+
+            // Check windowed average every 60 seconds (6,000 frames)
+            if (frame + 1) % 6000 == 0 {
+                let minute = (frame + 1) / 6000;
+                let window_avg = window_jitter_sum / (window_jitter_count as f64);
+                assert!(
+                    window_avg <= 3.0,
+                    "Minute {} window jitter ({:.2}ms) exceeded 3.0ms (old bug drifted to 8ms)",
+                    minute, window_avg
+                );
+                window_jitter_sum = 0.0;
+                window_jitter_count = 0;
+            }
+        }
+        let avg_jitter = jitter_sum / (jitter_count as f64);
+        assert_eq!(dropped_slices, 0, "Dropped {} slices during negative drift soak", dropped_slices);
+        // Jitter must remain tightly bounded around the 2.5ms sub-slice baseline and not creep to 8ms or 30ms
+        assert!(avg_jitter <= 3.0, "Average jitter ({:.2}ms) exceeded 3.0ms target", avg_jitter);
+        assert!(avg_jitter >= 2.0, "Average jitter ({:.2}ms) was unexpectedly below 2.0ms", avg_jitter);
+    }
+
+    #[test]
+    fn test_pts_clock_positive_drift_soak() {
+        // Simulate 8 minutes of audio streaming where remote clock runs 25 ppm faster.
+        let mut clock = PtsClock::new(30);
+        let start_instant = Instant::now();
+        let start_pts = 100_000u32;
+        let total_frames = 48_000;
+        let mut dropped_slices = 0;
+        let mut jitter_sum = 0.0;
+        let mut jitter_count = 0;
+
+        for frame in 0..total_frames {
+            let elapsed_ms = frame * 10;
+            let now = start_instant + Duration::from_millis(elapsed_ms as u64);
+            // Remote clock runs 25 ppm faster: gains ~12ms over 480,000ms
+            let remote_drift_ms = (elapsed_ms as f64 * 0.000025) as u32;
+            let frame_pts = start_pts + elapsed_ms + remote_drift_ms;
+
+            let sub0_pts = frame_pts;
+            if let Some(j) = clock.jitter_ms_at(sub0_pts, now) {
+                jitter_sum += j.abs() as f64;
+                jitter_count += 1;
+            }
+            if !clock.is_packet_acceptable_at(sub0_pts, now) {
+                dropped_slices += 1;
+            }
+
+            let sub1_pts = frame_pts + 5;
+            if let Some(j) = clock.jitter_ms_at(sub1_pts, now) {
+                jitter_sum += j.abs() as f64;
+                jitter_count += 1;
+            }
+            if !clock.is_packet_acceptable_at(sub1_pts, now) {
+                dropped_slices += 1;
+            }
+        }
+
+        let avg_jitter = jitter_sum / (jitter_count as f64);
+        assert_eq!(dropped_slices, 0, "Dropped {} slices during positive drift soak", dropped_slices);
+        assert!(avg_jitter <= 3.0, "Average jitter ({:.2}ms) exceeded 3.0ms target", avg_jitter);
+    }
+
+    #[test]
+    fn test_pts_clock_u32_wrapping() {
+        let mut clock = PtsClock::new(30);
+        let start_instant = Instant::now();
+        // Start near u32::MAX
+        let start_pts = u32::MAX - 50;
+        assert!(clock.is_packet_acceptable_at(start_pts, start_instant));
+
+        // Cross u32::MAX -> 0 after 100ms
+        let wrapped_pts = start_pts.wrapping_add(100); // 49
+        let now = start_instant + Duration::from_millis(100);
+        assert!(clock.is_packet_acceptable_at(wrapped_pts, now));
+        assert_eq!(clock.jitter_ms_at(wrapped_pts, now), Some(0));
     }
 }
