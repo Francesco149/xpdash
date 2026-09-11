@@ -4,6 +4,11 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild the nightly even if no commits landed since the last one'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 4 * * *'
 
@@ -11,8 +16,47 @@ permissions:
   contents: write
 
 jobs:
+  check-changes:
+    name: Check for New Commits
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Check whether HEAD was already built as nightly
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Scheduled runs skip unless HEAD differs from the commit the `nightly`
+          # tag (and its published release) already points at.
+          # Pushes always build; manual dispatches build unless they would be a
+          # no-op (pass force: true to republish the current commit anyway).
+          SHOULD_BUILD=true
+          if [ "${{ github.event_name }}" != "push" ] && [ "${{ inputs.force }}" != "true" ]; then
+            NIGHTLY_SHA=$(git rev-parse --verify --quiet 'nightly^{commit}' || true)
+            if [ -n "$NIGHTLY_SHA" ] && [ "$NIGHTLY_SHA" = "${{ github.sha }}" ] \
+               && gh release view nightly >/dev/null 2>&1; then
+              SHOULD_BUILD=false
+            fi
+          fi
+
+          if [ "$SHOULD_BUILD" = "true" ]; then
+            echo "Building: no nightly release published for ${{ github.sha }} yet."
+          else
+            echo "Skipping: nightly release for ${{ github.sha }} already exists."
+          fi
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+
   build-linux-and-agent:
     name: Build Linux Client & XP Agent
+    needs: check-changes
+    if: needs.check-changes.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -58,6 +102,8 @@ jobs:
 
   build-windows-client:
     name: Build Windows 10/11 Client
+    needs: check-changes
+    if: needs.check-changes.outputs.should_build == 'true'
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -94,7 +140,8 @@ jobs:
 
   publish-nightly:
     name: Publish Nightly Release
-    needs: [build-linux-and-agent, build-windows-client]
+    needs: [check-changes, build-linux-and-agent, build-windows-client]
+    if: needs.check-changes.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
