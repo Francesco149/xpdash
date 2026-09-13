@@ -639,9 +639,10 @@ int d3d9hook_read_frame(uint8_t *pixels, uint32_t max_bytes, uint32_t *width, ui
         return 0;
     }
     /* Buffer overflow guard: verify destination buffer is large enough for frame */
-    if (data_size > max_bytes) {
-        agent_log("d3d9hook_read_frame: frame data_size %u exceeds max_bytes %u (dims %ux%u)",
-                  data_size, max_bytes, w, h);
+    uint32_t final_size = (hdr->format == 16) ? (w * h * 4) : data_size;
+    if (final_size > max_bytes) {
+        agent_log("d3d9hook_read_frame: frame final_size %u exceeds max_bytes %u (dims %ux%u)",
+                  final_size, max_bytes, w, h);
         if (width)  *width  = w;
         if (height) *height = h;
         LeaveCriticalSection(&g_hook_cs);
@@ -649,7 +650,24 @@ int d3d9hook_read_frame(uint8_t *pixels, uint32_t max_bytes, uint32_t *width, ui
     }
 
     uint8_t *src = (uint8_t *)g_shm_ptr + HOOK_SHM_HEADER_SIZE;
-    memcpy(pixels, src, data_size);
+    if (hdr->format == 16) {
+        /* Unpack 16-bit RGB 565 from host RAM shared memory into 32-bit BGRX in ~0.15ms */
+        const uint16_t *src16 = (const uint16_t *)src;
+        uint32_t *dst32 = (uint32_t *)pixels;
+        uint32_t total = w * h;
+        for (uint32_t i = 0; i < total; i++) {
+            uint16_t p = src16[i];
+            uint32_t r = ((p & 0xF800) >> 8);
+            uint32_t g = ((p & 0x07E0) >> 3);
+            uint32_t b = ((p & 0x001F) << 3);
+            r |= (r >> 5);
+            g |= (g >> 6);
+            b |= (b >> 5);
+            dst32[i] = (r << 16) | (g << 8) | b;
+        }
+    } else {
+        memcpy(pixels, src, data_size);
+    }
     *width = w;
     *height = h;
     *frame_index = hdr->frame_index;

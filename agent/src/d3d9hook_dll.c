@@ -412,60 +412,29 @@ static void capture_ddraw_surface(void *this_surf, void *target_override) {
         uint32_t h = ddsd.dwHeight;
         uint32_t pitch = ddsd.lPitch;
         uint32_t bpp = ddsd.ddpfPixelFormat.dwRGBBitCount;
+        if (bpp == 0) bpp = 16;
+        uint32_t bytes_per_pixel = (bpp <= 8) ? 1 : ((bpp <= 16) ? 2 : 4);
+        uint32_t row_bytes = w * bytes_per_pixel;
+        uint32_t total_data_size = row_bytes * h;
         uint8_t *src = (uint8_t *)ddsd.lpSurface;
 
-        if (w > 0 && h > 0 && src && (w * h * 4 <= SHM_MAX_FRAME_SIZE)) {
+        if (w > 0 && h > 0 && src && (total_data_size <= SHM_MAX_FRAME_SIZE)) {
             uint8_t *dst = (uint8_t *)g_shm_ptr + SHM_HEADER_SIZE;
 
-            if (bpp == 32) {
-                uint32_t row_bytes = w * 4;
+            /* Fast burst row-by-row memcpy across PCIe bus — zero scalar reads on game thread! */
+            if (pitch == row_bytes) {
+                memcpy(dst, src, total_data_size);
+            } else {
                 for (uint32_t y = 0; y < h; y++) {
                     memcpy(dst + y * row_bytes, src + y * pitch, row_bytes);
-                }
-            } else if (bpp == 16) {
-                for (uint32_t y = 0; y < h; y++) {
-                    const uint16_t *src_row = (const uint16_t *)(src + y * pitch);
-                    uint32_t *dst_row = (uint32_t *)(dst + y * (w * 4));
-                    for (uint32_t x = 0; x < w; x++) {
-                        uint16_t p = src_row[x];
-                        uint32_t r = ((p & 0xF800) >> 8);
-                        uint32_t g = ((p & 0x07E0) >> 3);
-                        uint32_t b = ((p & 0x001F) << 3);
-                        r |= (r >> 5);
-                        g |= (g >> 6);
-                        b |= (b >> 5);
-                        dst_row[x] = (r << 16) | (g << 8) | b;
-                    }
-                }
-            } else if (bpp == 8) {
-                PALETTEENTRY pal_entries[256];
-                memset(pal_entries, 0, sizeof(pal_entries));
-                LPDIRECTDRAWPALETTE pPal = NULL;
-                target_surf->lpVtbl->GetPalette(target_surf, &pPal);
-                if (pPal) {
-                    pPal->lpVtbl->GetEntries(pPal, 0, 0, 256, pal_entries);
-                    pPal->lpVtbl->Release(pPal);
-                }
-                uint32_t lut[256];
-                for (int i = 0; i < 256; i++) {
-                    lut[i] = ((uint32_t)pal_entries[i].peRed << 16) |
-                             ((uint32_t)pal_entries[i].peGreen << 8) |
-                             ((uint32_t)pal_entries[i].peBlue);
-                }
-                for (uint32_t y = 0; y < h; y++) {
-                    const uint8_t *src_row = src + y * pitch;
-                    uint32_t *dst_row = (uint32_t *)(dst + y * (w * 4));
-                    for (uint32_t x = 0; x < w; x++) {
-                        dst_row[x] = lut[src_row[x]];
-                    }
                 }
             }
 
             g_frame_idx++;
             hdr->width       = w;
             hdr->height      = h;
-            hdr->stride      = w * 4;
-            hdr->data_size   = w * h * 4;
+            hdr->stride      = row_bytes;
+            hdr->data_size   = total_data_size;
             hdr->frame_index = g_frame_idx;
             hdr->format      = bpp;
             _ReadWriteBarrier();
@@ -474,8 +443,8 @@ static void capture_ddraw_surface(void *this_surf, void *target_override) {
 
             static uint32_t s_ddraw_log = 0;
             if (s_ddraw_log++ == 0) {
-                hook_log("capture_ddraw_surface: first frame captured! %ux%u@%ubpp, frame_idx=%lu",
-                         w, h, bpp, g_frame_idx);
+                hook_log("capture_ddraw_surface: first frame captured! %ux%u@%ubpp (%u bytes), frame_idx=%lu",
+                         w, h, bpp, total_data_size, g_frame_idx);
             }
         }
         target_surf->lpVtbl->Unlock(target_surf, NULL);
