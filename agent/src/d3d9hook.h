@@ -42,18 +42,21 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid);
 /* Check if the hook is active and producing frames */
 int d3d9hook_is_active(void);
 
+/* Check if a new frame is waiting in shared memory without reading it */
+int d3d9hook_has_new_frame(uint32_t *width, uint32_t *height);
+
 /* Wait for and read the next frame from the hook.
-   pixels: output buffer (must be at least width*height*4 bytes)
+   pixels: output buffer
+   max_bytes: capacity of pixels buffer (prevents buffer overflow on resolution changes)
    width, height: output dimensions
    frame_index: output frame counter
    timeout_ms: how long to wait (0 = no wait, check only)
-   Returns 1 if a new frame was read, 0 if no new frame available. */
-int d3d9hook_read_frame(uint8_t *pixels, uint32_t *width, uint32_t *height,
+   Returns 1 if a new frame was read, 0 if no new frame available or buffer too small. */
+int d3d9hook_read_frame(uint8_t *pixels, uint32_t max_bytes, uint32_t *width, uint32_t *height,
                         uint32_t *frame_index, DWORD timeout_ms);
 
 /* Get the current frame dimensions without reading pixels */
 int d3d9hook_get_dimensions(uint32_t *width, uint32_t *height);
-
 /* Cleanup: detach from shared memory, but does NOT unload the DLL
    from the game (that happens when the game exits). */
 void d3d9hook_shutdown(void);

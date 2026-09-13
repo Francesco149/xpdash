@@ -486,8 +486,34 @@ int d3d9hook_is_active(void) {
     LeaveCriticalSection(&g_hook_cs);
     return 1;
 }
+int d3d9hook_has_new_frame(uint32_t *width, uint32_t *height) {
+    if (!g_hook_cs_inited) return 0;
+    EnterCriticalSection(&g_hook_cs);
 
-int d3d9hook_read_frame(uint8_t *pixels, uint32_t *width, uint32_t *height,
+    if (!g_shm_ptr && !open_shm_locked()) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
+
+    HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+    if (hdr->magic != 0x48443344 || !hdr->hook_active) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
+
+    if (hdr->producer_seq == g_last_seq || hdr->producer_seq == 0) {
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
+
+    if (width)  *width  = hdr->width;
+    if (height) *height = hdr->height;
+
+    LeaveCriticalSection(&g_hook_cs);
+    return 1;
+}
+
+int d3d9hook_read_frame(uint8_t *pixels, uint32_t max_bytes, uint32_t *width, uint32_t *height,
                         uint32_t *frame_index, DWORD timeout_ms)
 {
     if (!g_hook_cs_inited) return 0;
@@ -567,10 +593,18 @@ int d3d9hook_read_frame(uint8_t *pixels, uint32_t *width, uint32_t *height,
         LeaveCriticalSection(&g_hook_cs);
         return 0;
     }
+    /* Buffer overflow guard: verify destination buffer is large enough for frame */
+    if (data_size > max_bytes) {
+        agent_log("d3d9hook_read_frame: frame data_size %u exceeds max_bytes %u (dims %ux%u)",
+                  data_size, max_bytes, w, h);
+        if (width)  *width  = w;
+        if (height) *height = h;
+        LeaveCriticalSection(&g_hook_cs);
+        return 0;
+    }
 
     uint8_t *src = (uint8_t *)g_shm_ptr + HOOK_SHM_HEADER_SIZE;
     memcpy(pixels, src, data_size);
-
     *width = w;
     *height = h;
     *frame_index = hdr->frame_index;

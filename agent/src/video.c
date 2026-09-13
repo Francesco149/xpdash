@@ -105,6 +105,9 @@ static void draw_cursor(HDC hdc) {
 #define KEYFRAME_INTERVAL 120
 #define JPEG_QUALITY 85
 
+static CRITICAL_SECTION g_video_cs;
+static int g_video_cs_inited = 0;
+
 static HDC g_hdc_screen = NULL;
 static HDC g_hdc_mem = NULL;
 static HBITMAP g_hbm = NULL;
@@ -113,7 +116,6 @@ static uint8_t *g_pixels = NULL;
 static uint8_t *g_prev_pixels = NULL;
 static uint8_t *g_comp_buf = NULL;
 static int g_comp_buf_cap = 0;
-
 static int g_width = 0;
 static int g_height = 0;
 static uint32_t g_frame_counter = 0;
@@ -224,7 +226,7 @@ void video_force_keyframe(void) {
     g_force_keyframe = 1;
 }
 
-int video_resize(int new_width, int new_height) {
+static int video_resize_locked(int new_width, int new_height) {
     agent_log("video_resize called: %dx%d", new_width, new_height);
     if (new_width <= 0 || new_height <= 0) {
         agent_log("video_resize invalid dims!");
@@ -368,6 +370,17 @@ int video_resize(int new_width, int new_height) {
     g_force_keyframe = 1;
     return 1;
 }
+int video_resize(int new_width, int new_height) {
+    if (!g_video_cs_inited) {
+        InitializeCriticalSection(&g_video_cs);
+        g_video_cs_inited = 1;
+    }
+    EnterCriticalSection(&g_video_cs);
+    int ret = video_resize_locked(new_width, new_height);
+    LeaveCriticalSection(&g_video_cs);
+    return ret;
+}
+
 
 int video_init(video_frame_cb callback, void *user_data) {
     g_cb = callback;
@@ -380,8 +393,11 @@ int video_init(video_frame_cb callback, void *user_data) {
         return 0;
     }
 
+    if (!g_video_cs_inited) {
+        InitializeCriticalSection(&g_video_cs);
+        g_video_cs_inited = 1;
+    }
     g_hdc_mem = CreateCompatibleDC(g_hdc_screen);
-    agent_log("video_init: CreateCompatibleDC = %p", g_hdc_mem);
     /* Initialize TurboJPEG compressor for JPEG video encoding */
     g_tj = tjInitCompress();
     if (!g_tj) {
@@ -435,93 +451,101 @@ static int is_screen_dirty(void) {
     return 0;
 }
 
-int video_capture(void) {
+static int video_capture_locked(void) {
     DWORD t0 = timeGetTime();
     uint32_t now = t0;
 
     /* ── Path A: D3D9 hook capture (zero-flicker, perfect timing) ──── */
     if (d3d9hook_is_active()) {
         uint32_t hook_w = 0, hook_h = 0, hook_idx = 0;
+        int should_attempt_read = 0;
+        DWORD hook_timeout = 0;
 
-        /* Ensure our pixel buffer can hold the hook's frame */
-        d3d9hook_get_dimensions(&hook_w, &hook_h);
-        if (hook_w > 0 && hook_h > 0 &&
-            ((int)hook_w != g_width || (int)hook_h != g_height)) {
-            agent_log("video_capture: D3D9 hook dimensions changed to %ux%u", hook_w, hook_h);
-            video_resize((int)hook_w, (int)hook_h);
-            net_send_video_resize((uint16_t)hook_w, (uint16_t)hook_h, (uint8_t)video_get_bpp());
-            video_force_keyframe();
+        if (s_in_hook_mode) {
+            /* In hook mode: game drives timing, wait up to 16ms for Present() */
+            should_attempt_read = 1;
+            hook_timeout = 16;
+            d3d9hook_get_dimensions(&hook_w, &hook_h);
+        } else {
+            /* In desktop mode: only attempt reading if a new hook frame is waiting! */
+            if (d3d9hook_has_new_frame(&hook_w, &hook_h)) {
+                should_attempt_read = 1;
+                hook_timeout = 0;
+            }
         }
 
-        /* If already in hook mode, wait up to 16ms for game Present().
-           If NOT in hook mode, poll non-blocking (timeout 0) so desktop BitBlt is never stalled! */
-        DWORD hook_timeout = s_in_hook_mode ? 16 : 0;
-
-        if (g_pixels && d3d9hook_read_frame(g_pixels, &hook_w, &hook_h,
-                                             &hook_idx, hook_timeout)) {
-            s_last_hook_frame_time = now;
-            if (!s_in_hook_mode) {
-                s_in_hook_mode = 1;
-                agent_log("video_capture: switched to D3D9 hook stream (%ux%u)", hook_w, hook_h);
-                if ((int)hook_w != g_width || (int)hook_h != g_height) {
-                    video_resize((int)hook_w, (int)hook_h);
-                    net_send_video_resize((uint16_t)hook_w, (uint16_t)hook_h, (uint8_t)video_get_bpp());
-                }
+        if (should_attempt_read) {
+            if (hook_w > 0 && hook_h > 0 &&
+                ((int)hook_w != g_width || (int)hook_h != g_height)) {
+                agent_log("video_capture: D3D9 hook dimensions changed to %ux%u", hook_w, hook_h);
+                video_resize_locked((int)hook_w, (int)hook_h);
+                net_send_video_resize((uint16_t)hook_w, (uint16_t)hook_h, (uint8_t)video_get_bpp());
                 video_force_keyframe();
             }
-            g_frame_counter = hook_idx;
 
-            /* Hook frames are always "dirty" — the hook only fires on Present */
-            DWORD t1 = timeGetTime();
-
-            /* Draw cursor onto hooked frame */
-            draw_cursor(g_hdc_mem);
-
-            DWORD t2 = timeGetTime();
-
-            unsigned long jpeg_size = 0;
-            unsigned char *jpeg_buf = g_comp_buf;
-            int comp_size = 0;
-            uint8_t codec;
-
-            if (g_tj && tjCompress2(g_tj, g_pixels, (int)hook_w, 0, (int)hook_h,
-                                     TJPF_BGRX, &jpeg_buf, &jpeg_size,
-                                     TJSAMP_420, g_jpeg_quality,
-                                     TJFLAG_FASTDCT | TJFLAG_NOREALLOC) == 0) {
-                comp_size = (int)jpeg_size;
-                codec = 1;  /* VIDEO_CODEC_JPEG */
-            } else {
-                /* JPEG failed — fall back to LZ4 */
-                int raw_size = (int)hook_w * (int)hook_h * 4;
-                comp_size = LZ4_compress_fast((const char *)g_pixels,
-                    (char *)g_comp_buf, raw_size, g_comp_buf_cap, 10);
-                codec = 2;  /* VIDEO_CODEC_LZ4 */
-            }
-
-            DWORD t3 = timeGetTime();
-
-            if (comp_size > 0 && g_cb) {
-                uint8_t flags = 0x01;  /* hook frames are always keyframes */
-
-                g_cb(g_comp_buf, (uint32_t)comp_size, g_frame_counter,
-                     (uint16_t)hook_w, (uint16_t)hook_h, codec, flags,
-                     now, g_cb_userdata);
-
-                DWORD t4 = timeGetTime();
-                static uint32_t s_hook_timing = 0;
-                s_hook_timing++;
-                if (s_hook_timing >= 120) {
-                    agent_log("frame_timing[hook]: read=%lums cursor=%lums "
-                              "comp=%lums send=%lums total=%lums comp_sz=%d",
-                              (unsigned long)(t1 - t0),
-                              (unsigned long)(t2 - t1),
-                              (unsigned long)(t3 - t2),
-                              (unsigned long)(t4 - t3),
-                              (unsigned long)(t4 - t0), comp_size);
-                    s_hook_timing = 0;
+            int max_bytes = g_width * g_height * 4;
+            if (g_pixels && d3d9hook_read_frame(g_pixels, (uint32_t)max_bytes, &hook_w, &hook_h,
+                                                 &hook_idx, hook_timeout)) {
+                s_last_hook_frame_time = now;
+                if (!s_in_hook_mode) {
+                    s_in_hook_mode = 1;
+                    agent_log("video_capture: switched to D3D9 hook stream (%ux%u)", hook_w, hook_h);
+                    video_force_keyframe();
                 }
+                g_frame_counter = hook_idx;
+
+                /* Hook frames are always "dirty" — the hook only fires on Present */
+                DWORD t1 = timeGetTime();
+
+                /* Draw cursor onto hooked frame */
+                draw_cursor(g_hdc_mem);
+
+                DWORD t2 = timeGetTime();
+
+                unsigned long jpeg_size = 0;
+                unsigned char *jpeg_buf = g_comp_buf;
+                int comp_size = 0;
+                uint8_t codec;
+
+                if (g_tj && tjCompress2(g_tj, g_pixels, (int)hook_w, 0, (int)hook_h,
+                                         TJPF_BGRX, &jpeg_buf, &jpeg_size,
+                                         TJSAMP_420, g_jpeg_quality,
+                                         TJFLAG_FASTDCT | TJFLAG_NOREALLOC) == 0) {
+                    comp_size = (int)jpeg_size;
+                    codec = 1;  /* VIDEO_CODEC_JPEG */
+                } else {
+                    /* JPEG failed — fall back to LZ4 */
+                    int raw_size = (int)hook_w * (int)hook_h * 4;
+                    comp_size = LZ4_compress_fast((const char *)g_pixels,
+                        (char *)g_comp_buf, raw_size, g_comp_buf_cap, 10);
+                    codec = 2;  /* VIDEO_CODEC_LZ4 */
+                }
+
+                DWORD t3 = timeGetTime();
+
+                if (comp_size > 0 && g_cb) {
+                    uint8_t flags = 0x01;  /* hook frames are always keyframes */
+
+                    g_cb(g_comp_buf, (uint32_t)comp_size, g_frame_counter,
+                         (uint16_t)hook_w, (uint16_t)hook_h, codec, flags,
+                         now, g_cb_userdata);
+
+                    DWORD t4 = timeGetTime();
+                    static uint32_t s_hook_timing = 0;
+                    s_hook_timing++;
+                    if (s_hook_timing >= 120) {
+                        agent_log("frame_timing[hook]: read=%lums cursor=%lums "
+                                  "comp=%lums send=%lums total=%lums comp_sz=%d",
+                                  (unsigned long)(t1 - t0),
+                                  (unsigned long)(t2 - t1),
+                                  (unsigned long)(t3 - t2),
+                                  (unsigned long)(t4 - t3),
+                                  (unsigned long)(t4 - t0), comp_size);
+                        s_hook_timing = 0;
+                    }
+                }
+                return 1;
             }
-            return 1;
         }
 
         /* If hook was active recently (< 120ms), wait for next Present() */
@@ -551,7 +575,7 @@ int video_capture(void) {
     /* In desktop BitBlt mode, adapt to desktop screen resolution changes */
     if (screen_w > 0 && screen_h > 0 &&
         (g_width != screen_w || g_height != screen_h || g_bpp != cur_bpp)) {
-        video_resize(screen_w, screen_h);
+        video_resize_locked(screen_w, screen_h);
         net_send_video_resize((uint16_t)screen_w, (uint16_t)screen_h, (uint8_t)cur_bpp);
         video_force_keyframe();
     }
@@ -718,9 +742,20 @@ int video_capture(void) {
 
     return 1;
 }
+int video_capture(void) {
+    if (!g_video_cs_inited) return 0;
+    EnterCriticalSection(&g_video_cs);
+    int ret = video_capture_locked();
+    LeaveCriticalSection(&g_video_cs);
+    return ret;
+}
+
 
 void video_shutdown(void) {
     video_stop();
+    if (g_video_cs_inited) {
+        EnterCriticalSection(&g_video_cs);
+    }
     if (g_hdc_mem8) {
         if (g_hbm8 && g_hbm8_old) {
             SelectObject(g_hdc_mem8, g_hbm8_old);
@@ -761,5 +796,10 @@ void video_shutdown(void) {
     if (g_hdc_screen) {
         ReleaseDC(NULL, g_hdc_screen);
         g_hdc_screen = NULL;
+    }
+    if (g_video_cs_inited) {
+        LeaveCriticalSection(&g_video_cs);
+        DeleteCriticalSection(&g_video_cs);
+        g_video_cs_inited = 0;
     }
 }
