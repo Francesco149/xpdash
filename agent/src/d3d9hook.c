@@ -460,10 +460,29 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
     g_injected_pid = target_pid;
     g_remote_dll_base = (HMODULE)exit_code;
     s_inject_time = timeGetTime();
-    /* Try to open shared memory — the hook DLL creates SHM in DllMain
-       immediately, but the hook installation is deferred to a background
-       thread (500ms delay for loader lock + device creation). Retry a
-       few times. */
+
+    /* Invoke install_d3d9_hooks in the target process to ensure hooks and SHM are active,
+       even if the DLL was already mapped into this process from a previous run! */
+    HMODULE hLocal = LoadLibraryA(dll_path);
+    if (hLocal) {
+        FARPROC pLocalFunc = GetProcAddress(hLocal, "install_d3d9_hooks");
+        if (pLocalFunc) {
+            uintptr_t func_rva = (uintptr_t)pLocalFunc - (uintptr_t)hLocal;
+            FARPROC pRemoteFunc = (FARPROC)(exit_code + func_rva);
+            HANDLE hHookThread = CreateRemoteThread(hProc, NULL, 0,
+                (LPTHREAD_START_ROUTINE)pRemoteFunc, NULL, 0, NULL);
+            if (hHookThread) {
+                WaitForSingleObject(hHookThread, 3000);
+                DWORD hook_exit = 0;
+                GetExitCodeThread(hHookThread, &hook_exit);
+                CloseHandle(hHookThread);
+                agent_log("d3d9hook_inject: install_d3d9_hooks returned %lu", hook_exit);
+            }
+        }
+        FreeLibrary(hLocal);
+    }
+
+    /* Try to open shared memory. Retry a few times. */
     EnterCriticalSection(&g_hook_cs);
     g_injected_proc = hProc;
     g_injected_pid = target_pid;

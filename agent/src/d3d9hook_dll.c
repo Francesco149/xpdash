@@ -621,8 +621,15 @@ static int install_hooks(void) {
     hook_log("install_hooks: installing hotpatch detours in PID %lu", GetCurrentProcessId());
 
     int hook_installed = 0;
-
     HMODULE hd3d9 = GetModuleHandleA("d3d9.dll");
+    HMODULE hddraw = GetModuleHandleA("ddraw.dll");
+
+    /* If neither graphics API is loaded yet (e.g. GTA SA during sound/intro init),
+       load d3d9.dll so CreateDevice is hooked before the game creates its D3D9 device.
+       If ddraw.dll is already loaded (pure DirectDraw game), do not load d3d9.dll. */
+    if (!hd3d9 && !hddraw) {
+        hd3d9 = LoadLibraryA("d3d9.dll");
+    }
     if (hd3d9) {
         uint32_t present_rva       = 0x40EA0;
         uint32_t reset_rva         = 0x436B0;
@@ -663,7 +670,7 @@ static int install_hooks(void) {
         }
     }
 
-    HMODULE hddraw = GetModuleHandleA("ddraw.dll");
+    if (!hddraw) hddraw = GetModuleHandleA("ddraw.dll");
     if (hddraw) {
         uint32_t flip_rva = 0x399C;
         if (g_shm_ptr) {
@@ -722,7 +729,14 @@ static void remove_hooks(void) {
 /* ─── DLL Exports & Entry Point ───────────────────────────────────────── */
 
 __declspec(dllexport) int install_d3d9_hooks(void) {
-    if (g_initialized && g_hooked_present_addr) return 1;
+    if (!g_shm_ptr) {
+        shm_init();
+    }
+    if (g_initialized && (g_hooked_present_addr || g_hooked_ddraw_flip_addr)) {
+        HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+        if (hdr) hdr->hook_active = 1;
+        return 1;
+    }
     if (install_hooks()) {
         HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
         if (hdr) hdr->hook_active = 1;

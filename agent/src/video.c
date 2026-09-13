@@ -183,12 +183,16 @@ static DWORD WINAPI video_worker_thread(LPVOID lpParam) {
             video_capture();
 
             if (!s_in_hook_mode) {
-                DWORD elapsed = timeGetTime() - t_start;
                 int eff_fps = get_effective_desktop_fps();
                 DWORD frame_interval = (eff_fps > 0) ? (1000 / eff_fps) : 16;
-                if (elapsed < frame_interval) {
-                    Sleep(frame_interval - elapsed);
-                } else {
+                DWORD target_time = t_start + frame_interval;
+                DWORD now = timeGetTime();
+                /* Coarse sleep if more than 3ms remaining to avoid burning CPU */
+                if (target_time > now + 3) {
+                    Sleep(target_time - now - 2);
+                }
+                /* Precise spin-wait / micro-yield for the final 1-2ms remainder */
+                while (timeGetTime() < target_time) {
                     Sleep(0);
                 }
             }
