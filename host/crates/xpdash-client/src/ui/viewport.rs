@@ -88,7 +88,18 @@ impl StreamViewport {
         let avail_rect = ui.available_rect_before_wrap();
         let avail_size = avail_rect.size();
 
-        let (guest_w, guest_h) = latest.as_ref().map(|f| (f.width as f32, f.height as f32)).unwrap_or((800.0, 600.0));
+        let (guest_w, guest_h) = latest
+            .as_ref()
+            .map(|f| (f.width as f32, f.height as f32))
+            .or_else(|| {
+                let m = session.metrics();
+                if m.screen_width > 0 && m.screen_height > 0 {
+                    Some((m.screen_width as f32, m.screen_height as f32))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((800.0, 600.0));
 
         let viewport_rect = if obs_mode {
             // OBS Source Mode: Fill 100% of the window area with 0 borders and 0 letterboxing

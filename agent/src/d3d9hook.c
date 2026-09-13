@@ -28,6 +28,7 @@ static uint32_t g_last_seq    = 0;
 static HANDLE  g_injected_proc = NULL;
 static DWORD   g_injected_pid  = 0;
 static HMODULE g_remote_dll_base = NULL;
+static DWORD   s_inject_time     = 0;
 
 /* ─── Init / Shutdown ─────────────────────────────────────────────────── */
 
@@ -167,6 +168,70 @@ void d3d9hook_shutdown(void) {
 }
 /* ─── Process Detection ───────────────────────────────────────────────── */
 
+static int is_blacklisted_process(const char *name) {
+    static const char *blacklist[] = {
+        "explorer.exe",
+        "svchost.exe",
+        "services.exe",
+        "lsass.exe",
+        "csrss.exe",
+        "smss.exe",
+        "winlogon.exe",
+        "spoolsv.exe",
+        "alg.exe",
+        "wscntfy.exe",
+        "ctfmon.exe",
+        "rundll32.exe",
+        "cmd.exe",
+        "tasklist.exe",
+        "taskmgr.exe",
+        "wmiprvse.exe",
+        "xpdash-agent.exe",
+        "Launch.exe",
+        "RTHDCPL.EXE",
+        "CTAudSvc.exe",
+        "sqlservr.exe",
+        "sqlwriter.exe",
+        "uphclean.exe",
+        "nvsvc32.exe",
+        "gcalsrv.exe",
+        "conime.exe",
+        "logonui.exe",
+        NULL
+    };
+    for (int i = 0; blacklist[i]; i++) {
+        if (lstrcmpiA(name, blacklist[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    DWORD pid;
+    HWND  hwnd;
+} FindProcessWnd;
+
+static BOOL CALLBACK enum_proc_wnd(HWND hwnd, LPARAM lParam) {
+    FindProcessWnd *fpw = (FindProcessWnd *)lParam;
+    DWORD wnd_pid = 0;
+    GetWindowThreadProcessId(hwnd, &wnd_pid);
+    if (wnd_pid == fpw->pid && IsWindowVisible(hwnd)) {
+        LONG style = GetWindowLongA(hwnd, GWL_STYLE);
+        if (!(style & WS_CHILD)) {
+            fpw->hwnd = hwnd;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static int process_has_visible_window(DWORD pid) {
+    FindProcessWnd fpw;
+    fpw.pid = pid;
+    fpw.hwnd = NULL;
+    EnumWindows(enum_proc_wnd, (LPARAM)&fpw);
+    return (fpw.hwnd != NULL);
+}
+
 /* Find the PID of a process that has d3d9.dll loaded.
    This is a heuristic — walk the module list of every process. */
 static DWORD find_d3d9_process(void) {
@@ -186,6 +251,8 @@ static DWORD find_d3d9_process(void) {
     do {
         if (pe.th32ProcessID == my_pid) continue;
         if (pe.th32ProcessID <= 4) continue;  /* system processes */
+        if (is_blacklisted_process(pe.szExeFile)) continue;
+
         /* Verify process is still alive before considering it */
         HANDLE hCheck = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
         if (!hCheck) continue;
@@ -197,14 +264,15 @@ static DWORD find_d3d9_process(void) {
         CloseHandle(hCheck);
 
         /* Direct match for known D3D9 game executables without needing module snapshot */
-        if (lstrcmpiA(pe.szExeFile, "gta_sa.exe") == 0) {
+        if (lstrcmpiA(pe.szExeFile, "gta_sa.exe") == 0 ||
+            lstrcmpiA(pe.szExeFile, "osu!.exe") == 0) {
             found_pid = pe.th32ProcessID;
             agent_log("d3d9hook: found known D3D9 game: %s (PID %lu)",
                       pe.szExeFile, (unsigned long)found_pid);
             break;
         }
 
-        /* Check if this process has d3d9.dll loaded */
+        /* Check if this process has d3d9.dll loaded and has an active visible window */
         HANDLE modsnap = CreateToolhelp32Snapshot(
             TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pe.th32ProcessID);
         if (modsnap == INVALID_HANDLE_VALUE) continue;
@@ -214,10 +282,12 @@ static DWORD find_d3d9_process(void) {
         if (Module32First(modsnap, &me)) {
             do {
                 if (lstrcmpiA(me.szModule, "d3d9.dll") == 0) {
-                    found_pid = pe.th32ProcessID;
-                    agent_log("d3d9hook: found D3D9 process: %s (PID %lu)",
-                              pe.szExeFile, (unsigned long)found_pid);
-                    break;
+                    if (process_has_visible_window(pe.th32ProcessID)) {
+                        found_pid = pe.th32ProcessID;
+                        agent_log("d3d9hook: found D3D9 process with visible window: %s (PID %lu)",
+                                  pe.szExeFile, (unsigned long)found_pid);
+                        break;
+                    }
                 }
             } while (Module32Next(modsnap, &me) && !found_pid);
         }
@@ -237,16 +307,31 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
     if (g_injected_proc) {
         DWORD code = 0;
         if (GetExitCodeProcess(g_injected_proc, &code) && code == STILL_ACTIVE) {
-            LeaveCriticalSection(&g_hook_cs);
-            return 1;
+            /* If the injected process has produced 0 frames for > 5 seconds,
+               detach so we can hook active D3D9 games instead of getting wedged. */
+            DWORD now = timeGetTime();
+            HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+            if (hdr && hdr->producer_seq == 0 && (now - s_inject_time > 5000)) {
+                agent_log("d3d9hook_inject: PID %lu produced 0 frames after 5s, detaching",
+                          (unsigned long)g_injected_pid);
+                close_shm_locked();
+                CloseHandle(g_injected_proc);
+                g_injected_proc = NULL;
+                g_injected_pid  = 0;
+                g_remote_dll_base = NULL;
+            } else {
+                LeaveCriticalSection(&g_hook_cs);
+                return 1;
+            }
+        } else {
+            agent_log("d3d9hook_inject: previously injected PID %lu exited, cleaning up",
+                      (unsigned long)g_injected_pid);
+            close_shm_locked();
+            CloseHandle(g_injected_proc);
+            g_injected_proc = NULL;
+            g_injected_pid  = 0;
+            g_remote_dll_base = NULL;
         }
-        agent_log("d3d9hook_inject: previously injected PID %lu exited, cleaning up",
-                  (unsigned long)g_injected_pid);
-        close_shm_locked();
-        CloseHandle(g_injected_proc);
-        g_injected_proc = NULL;
-        g_injected_pid  = 0;
-        g_remote_dll_base = NULL;
     }
     LeaveCriticalSection(&g_hook_cs);
     if (target_pid == 0) {
@@ -329,6 +414,7 @@ int d3d9hook_inject(const char *dll_path, DWORD target_pid) {
     g_injected_proc = hProc;
     g_injected_pid = target_pid;
     g_remote_dll_base = (HMODULE)exit_code;
+    s_inject_time = timeGetTime();
     /* Try to open shared memory — the hook DLL creates SHM in DllMain
        immediately, but the hook installation is deferred to a background
        thread (500ms delay for loader lock + device creation). Retry a
@@ -420,8 +506,8 @@ int d3d9hook_read_frame(uint8_t *pixels, uint32_t *width, uint32_t *height,
         return 0;
     }
 
-    /* Wait for a new frame if requested */
-    if (hdr->producer_seq == g_last_seq && timeout_ms > 0 && g_frame_event) {
+    /* Wait for a new frame if requested and hook has previously produced frames */
+    if (hdr->producer_seq == g_last_seq && timeout_ms > 0 && hdr->producer_seq > 0 && g_frame_event) {
         hWaitEvent = g_frame_event;
         ResetEvent(hWaitEvent);
     }

@@ -90,8 +90,10 @@ static HWND create_message_window(HINSTANCE hInstance) {
     wc.lpszClassName = "xpdash_agent_wnd";
     RegisterClassA(&wc);
 
-    return CreateWindowA("xpdash_agent_wnd", "xpdash_agent", 0, 0, 0, 0, 0,
-                         HWND_MESSAGE, NULL, hInstance, NULL);
+    /* Top-level unowned invisible popup window so Windows broadcasts WM_DISPLAYCHANGE to us.
+       HWND_MESSAGE message-only windows do NOT receive broadcast messages in Win32. */
+    return CreateWindowA("xpdash_agent_wnd", "xpdash_agent", WS_POPUP, 0, 0, 0, 0,
+                         NULL, NULL, hInstance, NULL);
 }
 static LONG WINAPI agent_exception_filter(PEXCEPTION_POINTERS ep) {
     if (ep && ep->ExceptionRecord) {

@@ -447,15 +447,26 @@ int video_capture(void) {
         d3d9hook_get_dimensions(&hook_w, &hook_h);
         if (hook_w > 0 && hook_h > 0 &&
             ((int)hook_w != g_width || (int)hook_h != g_height)) {
+            agent_log("video_capture: D3D9 hook dimensions changed to %ux%u", hook_w, hook_h);
             video_resize((int)hook_w, (int)hook_h);
+            net_send_video_resize((uint16_t)hook_w, (uint16_t)hook_h, (uint8_t)video_get_bpp());
+            video_force_keyframe();
         }
 
+        /* If already in hook mode, wait up to 16ms for game Present().
+           If NOT in hook mode, poll non-blocking (timeout 0) so desktop BitBlt is never stalled! */
+        DWORD hook_timeout = s_in_hook_mode ? 16 : 0;
+
         if (g_pixels && d3d9hook_read_frame(g_pixels, &hook_w, &hook_h,
-                                             &hook_idx, 16)) {
+                                             &hook_idx, hook_timeout)) {
             s_last_hook_frame_time = now;
             if (!s_in_hook_mode) {
                 s_in_hook_mode = 1;
                 agent_log("video_capture: switched to D3D9 hook stream (%ux%u)", hook_w, hook_h);
+                if ((int)hook_w != g_width || (int)hook_h != g_height) {
+                    video_resize((int)hook_w, (int)hook_h);
+                    net_send_video_resize((uint16_t)hook_w, (uint16_t)hook_h, (uint8_t)video_get_bpp());
+                }
                 video_force_keyframe();
             }
             g_frame_counter = hook_idx;
@@ -537,10 +548,9 @@ int video_capture(void) {
     int screen_w = GetSystemMetrics(SM_CXSCREEN);
     int screen_h = GetSystemMetrics(SM_CYSCREEN);
     int cur_bpp = GetDeviceCaps(g_hdc_screen, BITSPIXEL) * GetDeviceCaps(g_hdc_screen, PLANES);
-    /* Only check and adapt to desktop screen resolution if D3D9 hook is not active */
-    if (!d3d9hook_is_active() && screen_w > 0 && screen_h > 0 &&
+    /* In desktop BitBlt mode, adapt to desktop screen resolution changes */
+    if (screen_w > 0 && screen_h > 0 &&
         (g_width != screen_w || g_height != screen_h || g_bpp != cur_bpp)) {
-        agent_log("video_capture: screen display changed to %dx%d@%d", screen_w, screen_h, cur_bpp);
         video_resize(screen_w, screen_h);
         net_send_video_resize((uint16_t)screen_w, (uint16_t)screen_h, (uint8_t)cur_bpp);
         video_force_keyframe();
