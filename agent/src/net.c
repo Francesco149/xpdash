@@ -81,15 +81,29 @@ int net_init(void) {
         return 0;
     }
 
+    /* Enable SO_REUSEADDR so rapid agent restarts don't fail with WSAEADDRINUSE (10048) */
+    int opt = 1;
+    setsockopt(g_sock_udp, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+
     /* Bind to media port so we can both send media AND receive input */
     struct sockaddr_in udp_addr;
     memset(&udp_addr, 0, sizeof(udp_addr));
     udp_addr.sin_family = AF_INET;
     udp_addr.sin_addr.s_addr = INADDR_ANY;
     udp_addr.sin_port = htons(NET_UDP_MEDIA_PORT);
-    if (bind(g_sock_udp, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) != 0) {
-        agent_log("net_init: UDP bind to port %d failed, err=%d", NET_UDP_MEDIA_PORT, WSAGetLastError());
-        /* Non-fatal: sending still works, just no UDP input receive */
+
+    int bind_ok = 0;
+    for (int retry = 0; retry < 10; retry++) {
+        if (bind(g_sock_udp, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) == 0) {
+            bind_ok = 1;
+            break;
+        }
+        agent_log("net_init: UDP bind attempt %d to port %d failed (err=%d), retrying...",
+                  retry + 1, NET_UDP_MEDIA_PORT, WSAGetLastError());
+        Sleep(150);
+    }
+    if (!bind_ok) {
+        agent_log("FATAL: UDP bind to port %d failed after retries! Input cannot be received!", NET_UDP_MEDIA_PORT);
     }
 
     /* Non-blocking so poll doesn't stall */

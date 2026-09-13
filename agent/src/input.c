@@ -43,15 +43,6 @@ void input_inject_mouse_rel(int16_t dx, int16_t dy) {
     SendInput(1, &inp, sizeof(INPUT));
 }
 void input_inject_mouse_abs(uint16_t x, uint16_t y) {
-    /* Check if system cursor is currently shown or hidden */
-    CURSORINFO ci;
-    memset(&ci, 0, sizeof(ci));
-    ci.cbSize = sizeof(CURSORINFO);
-    int cursor_showing = 1;
-    if (GetCursorInfo(&ci)) {
-        cursor_showing = (ci.flags & CURSOR_SHOWING) != 0;
-    }
-
     int sw = GetSystemMetrics(SM_CXSCREEN);
     int sh = GetSystemMetrics(SM_CYSCREEN);
     int px = (int)(((uint32_t)x * (uint32_t)sw + 32768) / 65535);
@@ -59,29 +50,12 @@ void input_inject_mouse_abs(uint16_t x, uint16_t y) {
     if (px >= sw) px = sw - 1;
     if (py >= sh) py = sh - 1;
 
-    if (cursor_showing) {
-        /* Desktop / Menu mode: set cursor position directly.
-           Deduplicate redundant positions and avoid redundant SendInput calls. */
-        if (px == s_prev_abs_x && py == s_prev_abs_y) {
-            return;
-        }
-        SetCursorPos(px, py);
-        s_prev_abs_x = px;
-        s_prev_abs_y = py;
-    } else {
-        /* 3D Gameplay mode: cursor is hidden by game!
-           Do NOT call SetCursorPos which conflicts with GTA SA's camera re-centering!
-           Pass unmodified 1:1 relative mouse movement. */
-        if (s_prev_abs_x >= 0 && s_prev_abs_y >= 0) {
-            int dx = px - s_prev_abs_x;
-            int dy = py - s_prev_abs_y;
-            if (dx != 0 || dy != 0) {
-                input_inject_mouse_rel((int16_t)dx, (int16_t)dy);
-            }
-        }
-        s_prev_abs_x = px;
-        s_prev_abs_y = py;
+    if (px == s_prev_abs_x && py == s_prev_abs_y) {
+        return;
     }
+    SetCursorPos(px, py);
+    s_prev_abs_x = px;
+    s_prev_abs_y = py;
 }
 
 void input_reset_buttons(void) {
