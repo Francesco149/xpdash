@@ -16,6 +16,7 @@
 #define _WIN32_WINNT 0x0501
 #include <windows.h>
 #include <d3d9.h>
+#include <ddraw.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -57,7 +58,8 @@ typedef struct {
     volatile uint32_t present_rva;        /* RVA of Present in d3d9.dll (e.g. 0x40EA0) */
     volatile uint32_t reset_rva;          /* RVA of Reset in d3d9.dll (e.g. 0x436B0) */
     volatile uint32_t create_device_rva;  /* RVA of CreateDevice in d3d9.dll (e.g. 0x81670) */
-    uint8_t           reserved[12];       /* pad to 64 bytes */
+    volatile uint32_t ddraw_flip_rva;     /* RVA of Flip in ddraw.dll (e.g. 0x399C) */
+    uint8_t           reserved[8];        /* pad to 64 bytes */
     /* Pixel data follows at offset 64 */
 } HookShmHeader;
 
@@ -80,7 +82,14 @@ typedef HRESULT (WINAPI *CreateDevice_t)(IDirect3D9 *d3d, UINT Adapter, D3DDEVTY
     HWND hFocusWindow, DWORD BehaviorFlags,
     D3DPRESENT_PARAMETERS *pPresentationParameters,
     IDirect3DDevice9 **ppReturnedDeviceInterface);
+typedef HRESULT (WINAPI *DDrawFlip_t)(void *this_surf, void *surf_target_override, DWORD flags);
 
+/* ─── Globals ─────────────────────────────────────────────────────────── */
+
+static DDrawFlip_t    g_orig_ddraw_flip    = NULL;
+static uint8_t        g_orig_ddraw_flip_bytes[5];
+static uint8_t        g_ddraw_flip_trampoline[16];
+static void          *g_hooked_ddraw_flip_addr = NULL;
 /* ─── Globals ─────────────────────────────────────────────────────────── */
 
 static Present_t      g_orig_present       = NULL;
@@ -367,6 +376,123 @@ static HRESULT WINAPI hook_present(IDirect3DDevice9 *dev,
 
     return g_orig_present(dev, src, dst, hWnd, dirty);
 }
+static void capture_ddraw_surface(void *this_surf, void *target_override) {
+    if (!g_shm_ptr || !g_frame_event) return;
+
+    HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+    if (hdr->producer_seq != hdr->consumer_seq) {
+        return;
+    }
+
+    IDirectDrawSurface7 *target_surf = (IDirectDrawSurface7 *)target_override;
+    int need_release = 0;
+
+    if (!target_surf) {
+        IDirectDrawSurface7 *front = (IDirectDrawSurface7 *)this_surf;
+        DDSCAPS2 caps;
+        memset(&caps, 0, sizeof(caps));
+        caps.dwCaps = DDSCAPS_BACKBUFFER;
+        if (FAILED(front->lpVtbl->GetAttachedSurface(front, &caps, &target_surf)) || !target_surf) {
+            return;
+        }
+        need_release = 1;
+    }
+
+    DDSURFACEDESC2 ddsd;
+    memset(&ddsd, 0, sizeof(ddsd));
+    ddsd.dwSize = sizeof(DDSURFACEDESC2);
+    HRESULT hr_lock = target_surf->lpVtbl->Lock(target_surf, NULL, &ddsd, DDLOCK_READONLY | DDLOCK_WAIT, NULL);
+    if (FAILED(hr_lock)) {
+        ddsd.dwSize = sizeof(DDSURFACEDESC);
+        hr_lock = target_surf->lpVtbl->Lock(target_surf, NULL, &ddsd, DDLOCK_READONLY | DDLOCK_WAIT, NULL);
+    }
+
+    if (SUCCEEDED(hr_lock)) {
+        uint32_t w = ddsd.dwWidth;
+        uint32_t h = ddsd.dwHeight;
+        uint32_t pitch = ddsd.lPitch;
+        uint32_t bpp = ddsd.ddpfPixelFormat.dwRGBBitCount;
+        uint8_t *src = (uint8_t *)ddsd.lpSurface;
+
+        if (w > 0 && h > 0 && src && (w * h * 4 <= SHM_MAX_FRAME_SIZE)) {
+            uint8_t *dst = (uint8_t *)g_shm_ptr + SHM_HEADER_SIZE;
+
+            if (bpp == 32) {
+                uint32_t row_bytes = w * 4;
+                for (uint32_t y = 0; y < h; y++) {
+                    memcpy(dst + y * row_bytes, src + y * pitch, row_bytes);
+                }
+            } else if (bpp == 16) {
+                for (uint32_t y = 0; y < h; y++) {
+                    const uint16_t *src_row = (const uint16_t *)(src + y * pitch);
+                    uint32_t *dst_row = (uint32_t *)(dst + y * (w * 4));
+                    for (uint32_t x = 0; x < w; x++) {
+                        uint16_t p = src_row[x];
+                        uint32_t r = ((p & 0xF800) >> 8);
+                        uint32_t g = ((p & 0x07E0) >> 3);
+                        uint32_t b = ((p & 0x001F) << 3);
+                        r |= (r >> 5);
+                        g |= (g >> 6);
+                        b |= (b >> 5);
+                        dst_row[x] = (r << 16) | (g << 8) | b;
+                    }
+                }
+            } else if (bpp == 8) {
+                PALETTEENTRY pal_entries[256];
+                memset(pal_entries, 0, sizeof(pal_entries));
+                LPDIRECTDRAWPALETTE pPal = NULL;
+                target_surf->lpVtbl->GetPalette(target_surf, &pPal);
+                if (pPal) {
+                    pPal->lpVtbl->GetEntries(pPal, 0, 0, 256, pal_entries);
+                    pPal->lpVtbl->Release(pPal);
+                }
+                uint32_t lut[256];
+                for (int i = 0; i < 256; i++) {
+                    lut[i] = ((uint32_t)pal_entries[i].peRed << 16) |
+                             ((uint32_t)pal_entries[i].peGreen << 8) |
+                             ((uint32_t)pal_entries[i].peBlue);
+                }
+                for (uint32_t y = 0; y < h; y++) {
+                    const uint8_t *src_row = src + y * pitch;
+                    uint32_t *dst_row = (uint32_t *)(dst + y * (w * 4));
+                    for (uint32_t x = 0; x < w; x++) {
+                        dst_row[x] = lut[src_row[x]];
+                    }
+                }
+            }
+
+            g_frame_idx++;
+            hdr->width       = w;
+            hdr->height      = h;
+            hdr->stride      = w * 4;
+            hdr->data_size   = w * h * 4;
+            hdr->frame_index = g_frame_idx;
+            hdr->format      = bpp;
+            _ReadWriteBarrier();
+            hdr->producer_seq = g_frame_idx;
+            SetEvent(g_frame_event);
+
+            static uint32_t s_ddraw_log = 0;
+            if (s_ddraw_log++ == 0) {
+                hook_log("capture_ddraw_surface: first frame captured! %ux%u@%ubpp, frame_idx=%lu",
+                         w, h, bpp, g_frame_idx);
+            }
+        }
+        target_surf->lpVtbl->Unlock(target_surf, NULL);
+    }
+
+    if (need_release && target_surf) {
+        target_surf->lpVtbl->Release(target_surf);
+    }
+}
+
+static HRESULT WINAPI hook_ddraw_flip(void *this_surf, void *surf_target_override, DWORD flags) {
+    EnterCriticalSection(&g_cs);
+    capture_ddraw_surface(this_surf, surf_target_override);
+    LeaveCriticalSection(&g_cs);
+    return g_orig_ddraw_flip(this_surf, surf_target_override, flags);
+}
+
 
 static HRESULT WINAPI hook_reset(IDirect3DDevice9 *dev,
     D3DPRESENT_PARAMETERS *pp)
@@ -488,65 +614,104 @@ static int install_hotpatch(void *target, void *hook, uint8_t *trampoline, void 
     FlushInstructionCache(GetCurrentProcess(), trampoline, 8);
     return 1;
 }
+static int install_5byte_detour(void *target, void *hook, uint8_t *trampoline, void **p_orig, uint8_t *saved_bytes) {
+    uint8_t *p = (uint8_t *)target;
+    if (IsBadReadPtr(p, 5)) {
+        hook_log("install_5byte_detour: target %p is unreadable memory", target);
+        return 0;
+    }
+    memcpy(saved_bytes, p, 5);
+
+    DWORD oldProtect;
+    if (!VirtualProtect(trampoline, 16, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        hook_log("install_5byte_detour: VirtualProtect on trampoline failed, err=%lu", GetLastError());
+        return 0;
+    }
+
+    memcpy(trampoline, p, 5);
+    trampoline[5] = 0xE9; // JMP rel32
+    uint32_t rel_trampoline = (uint32_t)((p + 5) - (&trampoline[5] + 5));
+    memcpy(&trampoline[6], &rel_trampoline, 4);
+    *p_orig = (void *)trampoline;
+
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        hook_log("install_5byte_detour: VirtualProtect on target failed, err=%lu", GetLastError());
+        return 0;
+    }
+    p[0] = 0xE9;
+    uint32_t rel_hook = (uint32_t)((uint8_t *)hook - (p + 5));
+    memcpy(&p[1], &rel_hook, 4);
+    VirtualProtect(p, 5, oldProtect, &oldProtect);
+
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, 10);
+    return 1;
+}
 
 static int install_hooks(void) {
     hook_log("install_hooks: installing hotpatch detours in PID %lu", GetCurrentProcessId());
 
+    int hook_installed = 0;
+
     HMODULE hd3d9 = GetModuleHandleA("d3d9.dll");
-    if (!hd3d9) hd3d9 = LoadLibraryA("d3d9.dll");
-    if (!hd3d9) {
-        hook_log("install_hooks: d3d9.dll not found in process");
-        return 0;
+    if (hd3d9) {
+        uint32_t present_rva       = 0x40EA0;
+        uint32_t reset_rva         = 0x436B0;
+        uint32_t create_device_rva = 0x81670;
+        if (g_shm_ptr) {
+            HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+            if (hdr->present_rva != 0)       present_rva       = hdr->present_rva;
+            if (hdr->reset_rva != 0)         reset_rva         = hdr->reset_rva;
+            if (hdr->create_device_rva != 0) create_device_rva = hdr->create_device_rva;
+        }
+
+        uint8_t *pPresent       = (uint8_t *)((uintptr_t)hd3d9 + present_rva);
+        uint8_t *pReset         = (uint8_t *)((uintptr_t)hd3d9 + reset_rva);
+        uint8_t *pCreateDevice  = (uint8_t *)((uintptr_t)hd3d9 + create_device_rva);
+
+        int ok_present = install_hotpatch(pPresent, (void *)hook_present, g_present_trampoline,
+                                          (void **)&g_orig_present, g_orig_present_bytes);
+        if (ok_present) {
+            g_hooked_present_addr = pPresent;
+            hook_log("install_hooks: D3D9 Present hotpatched successfully at %p", pPresent);
+            hook_installed = 1;
+        }
+
+        int ok_reset = install_hotpatch(pReset, (void *)hook_reset, g_reset_trampoline,
+                                        (void **)&g_orig_reset, g_orig_reset_bytes);
+        if (ok_reset) {
+            g_hooked_reset_addr = pReset;
+            hook_log("install_hooks: D3D9 Reset hotpatched successfully at %p", pReset);
+        }
+
+        int ok_create = install_hotpatch(pCreateDevice, (void *)hook_create_device,
+                                         g_create_device_trampoline,
+                                         (void **)&g_orig_create_device,
+                                         g_orig_create_device_bytes);
+        if (ok_create) {
+            g_hooked_create_device_addr = pCreateDevice;
+            hook_log("install_hooks: D3D9 CreateDevice hotpatched successfully at %p", pCreateDevice);
+        }
     }
 
-    uint32_t present_rva       = 0x40EA0;
-    uint32_t reset_rva         = 0x436B0;
-    uint32_t create_device_rva = 0x81670;
-    if (g_shm_ptr) {
-        HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
-        if (hdr->present_rva != 0)       present_rva       = hdr->present_rva;
-        if (hdr->reset_rva != 0)         reset_rva         = hdr->reset_rva;
-        if (hdr->create_device_rva != 0) create_device_rva = hdr->create_device_rva;
+    HMODULE hddraw = GetModuleHandleA("ddraw.dll");
+    if (hddraw) {
+        uint32_t flip_rva = 0x399C;
+        if (g_shm_ptr) {
+            HookShmHeader *hdr = (HookShmHeader *)g_shm_ptr;
+            if (hdr->ddraw_flip_rva != 0) flip_rva = hdr->ddraw_flip_rva;
+        }
+        uint8_t *pFlip = (uint8_t *)((uintptr_t)hddraw + flip_rva);
+        if (install_5byte_detour(pFlip, (void *)hook_ddraw_flip, g_ddraw_flip_trampoline,
+                                (void **)&g_orig_ddraw_flip, g_orig_ddraw_flip_bytes)) {
+            g_hooked_ddraw_flip_addr = pFlip;
+            hook_log("install_hooks: DirectDraw Flip detoured successfully at %p (RVA 0x%lX)",
+                     pFlip, (unsigned long)flip_rva);
+            hook_installed = 1;
+        }
     }
 
-    uint8_t *pPresent       = (uint8_t *)((uintptr_t)hd3d9 + present_rva);
-    uint8_t *pReset         = (uint8_t *)((uintptr_t)hd3d9 + reset_rva);
-    uint8_t *pCreateDevice  = (uint8_t *)((uintptr_t)hd3d9 + create_device_rva);
-
-    int ok_present = install_hotpatch(pPresent, (void *)hook_present, g_present_trampoline,
-                                      (void **)&g_orig_present, g_orig_present_bytes);
-    if (!ok_present) {
-        hook_log("install_hooks: hotpatching Present at %p (RVA 0x%lX) failed",
-                 pPresent, (unsigned long)present_rva);
-        return 0;
-    }
-    g_hooked_present_addr = pPresent;
-    hook_log("install_hooks: Present hotpatched successfully at %p (orig_present=%p)",
-             pPresent, g_orig_present);
-
-    int ok_reset = install_hotpatch(pReset, (void *)hook_reset, g_reset_trampoline,
-                                    (void **)&g_orig_reset, g_orig_reset_bytes);
-    if (ok_reset) {
-        g_hooked_reset_addr = pReset;
-        hook_log("install_hooks: Reset hotpatched successfully at %p (orig_reset=%p)",
-                 pReset, g_orig_reset);
-    } else {
-        hook_log("install_hooks: Reset hotpatch failed (will continue with Present hook only)");
-    }
-
-    int ok_create = install_hotpatch(pCreateDevice, (void *)hook_create_device,
-                                     g_create_device_trampoline,
-                                     (void **)&g_orig_create_device,
-                                     g_orig_create_device_bytes);
-    if (ok_create) {
-        g_hooked_create_device_addr = pCreateDevice;
-        hook_log("install_hooks: CreateDevice hotpatched successfully at %p (orig_create=%p)",
-                 pCreateDevice, g_orig_create_device);
-    } else {
-        hook_log("install_hooks: CreateDevice hotpatch failed (RVA 0x%lX)", (unsigned long)create_device_rva);
-    }
-
-    return 1;
+    return hook_installed;
 }
 
 static void remove_hooks(void) {
@@ -574,6 +739,14 @@ static void remove_hooks(void) {
             FlushInstructionCache(GetCurrentProcess(), g_hooked_create_device_addr, 5);
         }
         g_hooked_create_device_addr = NULL;
+    }
+    if (g_hooked_ddraw_flip_addr) {
+        if (VirtualProtect(g_hooked_ddraw_flip_addr, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            memcpy(g_hooked_ddraw_flip_addr, g_orig_ddraw_flip_bytes, 5);
+            VirtualProtect(g_hooked_ddraw_flip_addr, 5, oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), g_hooked_ddraw_flip_addr, 5);
+        }
+        g_hooked_ddraw_flip_addr = NULL;
     }
     hook_log("remove_hooks: hotpatch detours restored cleanly");
 }

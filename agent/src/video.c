@@ -462,10 +462,9 @@ static int video_capture_locked(void) {
         DWORD hook_timeout = 0;
 
         if (s_in_hook_mode) {
-            /* In hook mode: game drives timing, wait up to 16ms for Present() */
+            /* In hook mode: game drives timing, wait up to 30ms for Present() (covers 60Hz 16.6ms intervals) */
             should_attempt_read = 1;
-            hook_timeout = 16;
-            d3d9hook_get_dimensions(&hook_w, &hook_h);
+            hook_timeout = 30;
         } else {
             /* In desktop mode: only attempt reading if a new hook frame is waiting! */
             if (d3d9hook_has_new_frame(&hook_w, &hook_h)) {
@@ -548,8 +547,8 @@ static int video_capture_locked(void) {
             }
         }
 
-        /* If hook was active recently (< 120ms), wait for next Present() */
-        if (s_in_hook_mode && (now - s_last_hook_frame_time < 120)) {
+        /* If hook was active recently (< 200ms), wait for next Present() */
+        if (s_in_hook_mode && (now - s_last_hook_frame_time < 200)) {
             return 1;
         }
 

@@ -32,11 +32,11 @@ echo "[*] Compiling xpdash-hook.dll with $CC..."
     -static-libgcc \
     src/d3d9hook_dll.c \
     -o bin/xpdash-hook.dll \
-    -ld3d9 -luser32 -lgdi32
+    -ld3d9 -lddraw -ldxguid -luser32 -lgdi32
 
 # Check imported DLLs for XP-safety (hook DLL)
 bad_hook="$("$OBJDUMP" -p bin/xpdash-hook.dll | awk '/DLL Name/{print $3}' \
-        | grep -ivE '^(KERNEL32|USER32|ADVAPI32|GDI32|d3d9|msvcrt)\.dll$' || true)"
+        | grep -ivE '^(KERNEL32|USER32|ADVAPI32|GDI32|d3d9|ddraw|msvcrt)\.dll$' || true)"
 
 if [ -n "$bad_hook" ]; then
     echo "[!] Warning: xpdash-hook.dll non-stock XP imports:"

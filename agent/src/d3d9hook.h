@@ -27,7 +27,8 @@ typedef struct {
     volatile uint32_t present_rva;
     volatile uint32_t reset_rva;
     volatile uint32_t create_device_rva;
-    uint8_t           reserved[12];
+    volatile uint32_t ddraw_flip_rva;
+    uint8_t           reserved[8];
 } HookShmHeader;
 
 /* Initialize the hook subsystem (does not inject yet) */

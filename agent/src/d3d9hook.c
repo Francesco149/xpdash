@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <d3d9.h>
+#include <ddraw.h>
 #include <stdio.h>
 
 /* ─── State ───────────────────────────────────────────────────────────── */
@@ -79,6 +80,45 @@ static void resolve_d3d9_rvas(uint32_t *p_present_rva, uint32_t *p_reset_rva, ui
     agent_log("d3d9hook_init: resolved D3D9 RVAs: Present=0x%lX, Reset=0x%lX, CreateDevice=0x%lX",
               (unsigned long)*p_present_rva, (unsigned long)*p_reset_rva, (unsigned long)*p_create_rva);
 }
+static void resolve_ddraw_rva(uint32_t *p_flip_rva) {
+    *p_flip_rva = 0x399C; /* Standard XP SP3 fallback */
+
+    HMODULE hdd = LoadLibraryA("ddraw.dll");
+    if (!hdd) return;
+
+    typedef HRESULT (WINAPI *DirectDrawCreateEx_fn)(GUID *, VOID **, REFIID, IUnknown *);
+    static const GUID IID_IDirectDraw7_val = { 0x15e65ec0, 0x3b9c, 0x11d2, { 0xb9, 0x2f, 0x00, 0x60, 0x97, 0x97, 0xea, 0x4b } };
+    DirectDrawCreateEx_fn pCreateEx = (DirectDrawCreateEx_fn)(void *)GetProcAddress(hdd, "DirectDrawCreateEx");
+    if (pCreateEx) {
+        LPDIRECTDRAW7 pdd = NULL;
+        if (SUCCEEDED(pCreateEx(NULL, (void**)&pdd, &IID_IDirectDraw7_val, NULL)) && pdd) {
+            HWND hwnd = CreateWindowExA(0, "STATIC", "xpdash_ddprobe", WS_POPUP, 0, 0, 1, 1, NULL, NULL, GetModuleHandleA(NULL), NULL);
+            pdd->lpVtbl->SetCooperativeLevel(pdd, hwnd, DDSCL_NORMAL);
+
+            DDSURFACEDESC2 ddsd;
+            memset(&ddsd, 0, sizeof(ddsd));
+            ddsd.dwSize = sizeof(ddsd);
+            ddsd.dwFlags = DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT;
+            ddsd.ddsCaps.dwCaps = DDSCAPS_OFFSCREENPLAIN | DDSCAPS_SYSTEMMEMORY;
+            ddsd.dwWidth = 16;
+            ddsd.dwHeight = 16;
+
+            LPDIRECTDRAWSURFACE7 surf = NULL;
+            if (SUCCEEDED(pdd->lpVtbl->CreateSurface(pdd, &ddsd, &surf, NULL)) && surf) {
+                void **vt = *(void***)surf;
+                uintptr_t flip_addr = (uintptr_t)vt[11];
+                if (flip_addr > (uintptr_t)hdd) {
+                    *p_flip_rva = (uint32_t)(flip_addr - (uintptr_t)hdd);
+                }
+                surf->lpVtbl->Release(surf);
+            }
+            pdd->lpVtbl->Release(pdd);
+            if (hwnd) DestroyWindow(hwnd);
+        }
+    }
+    agent_log("d3d9hook_init: resolved DirectDraw Flip RVA: 0x%lX", (unsigned long)*p_flip_rva);
+}
+
 
 int d3d9hook_init(void) {
     if (!g_hook_cs_inited) {
@@ -95,8 +135,9 @@ int d3d9hook_init(void) {
     g_injected_pid  = 0;
     g_remote_dll_base = NULL;
 
-    uint32_t present_rva = 0, reset_rva = 0, create_rva = 0;
+    uint32_t present_rva = 0, reset_rva = 0, create_rva = 0, ddraw_flip_rva = 0;
     resolve_d3d9_rvas(&present_rva, &reset_rva, &create_rva);
+    resolve_ddraw_rva(&ddraw_flip_rva);
 
     /* Pre-create shared memory mapping and write dynamic RVAs so injected hook can read them */
     g_shm_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
@@ -109,6 +150,7 @@ int d3d9hook_init(void) {
             hdr->present_rva       = present_rva;
             hdr->reset_rva         = reset_rva;
             hdr->create_device_rva = create_rva;
+            hdr->ddraw_flip_rva    = ddraw_flip_rva;
             hdr->hook_active = 0;
         }
     }
@@ -264,10 +306,12 @@ static DWORD find_d3d9_process(void) {
         CloseHandle(hCheck);
 
         /* Direct match for known D3D9 game executables without needing module snapshot */
+        /* Direct match for known game executables */
         if (lstrcmpiA(pe.szExeFile, "gta_sa.exe") == 0 ||
-            lstrcmpiA(pe.szExeFile, "osu!.exe") == 0) {
+            lstrcmpiA(pe.szExeFile, "osu!.exe") == 0 ||
+            lstrcmpiA(pe.szExeFile, "SpriteAnimate.exe") == 0) {
             found_pid = pe.th32ProcessID;
-            agent_log("d3d9hook: found known D3D9 game: %s (PID %lu)",
+            agent_log("d3d9hook: found known game: %s (PID %lu)",
                       pe.szExeFile, (unsigned long)found_pid);
             break;
         }
@@ -281,11 +325,12 @@ static DWORD find_d3d9_process(void) {
         me.dwSize = sizeof(me);
         if (Module32First(modsnap, &me)) {
             do {
-                if (lstrcmpiA(me.szModule, "d3d9.dll") == 0) {
+                if (lstrcmpiA(me.szModule, "d3d9.dll") == 0 ||
+                    lstrcmpiA(me.szModule, "ddraw.dll") == 0) {
                     if (process_has_visible_window(pe.th32ProcessID)) {
                         found_pid = pe.th32ProcessID;
-                        agent_log("d3d9hook: found D3D9 process with visible window: %s (PID %lu)",
-                                  pe.szExeFile, (unsigned long)found_pid);
+                        agent_log("d3d9hook: found graphics process (%s) with visible window: %s (PID %lu)",
+                                  me.szModule, pe.szExeFile, (unsigned long)found_pid);
                         break;
                     }
                 }
